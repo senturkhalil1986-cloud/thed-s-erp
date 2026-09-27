@@ -1,4 +1,30 @@
 import streamlit as st
+
+# --- GİRİŞ KONTROLÜ ---
+def check_password():
+    """Kullanıcı adı ve şifre kontrolü yapar."""
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.subheader("🔐 THE DIŞ TİCARET - ERP Giriş Paneli")
+        username = st.text_input("Kullanıcı Adı")
+        password = st.text_input("Şifre", type="password")
+        
+        if st.button("Giriş Yap"):
+            if username == "thedisticaret" and password == "1453":
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Hatalı kullanıcı adı veya şifre!")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
+
+# --- BURADAN SONRASI MEVCUT ERP KODLARIN ---
+import streamlit as st
 import pandas as pd
 from datetime import datetime
 import os
