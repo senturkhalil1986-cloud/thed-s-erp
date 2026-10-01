@@ -5,23 +5,129 @@ import os
 from PIL import Image
 from io import BytesIO
 
-# --- GİRİŞ KONTROLÜ ---
-def check_password():
-    """Kullanıcı adı ve şifre kontrolü yapar."""
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
+# --- GÜVENLİ GİRİŞ / KULLANICI YÖNETİMİ ---
+import sqlite3
+import hashlib
+import hmac
+import secrets
+import tempfile
+import threading
+import logging
+import json
 
-    if not st.session_state["authenticated"]:
-        st.subheader("🔐 THE DIŞ TİCARET - ERP Giriş Paneli")
-        username = st.text_input("Kullanıcı Adı")
-        password = st.text_input("Şifre", type="password")
-        
-        if st.button("Giriş Yap"):
-            if username == "thedisticaret" and password == "1453":
-                st.session_state["authenticated"] = True
-                st.rerun()
+st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
+
+DB_DIR = "data"
+os.makedirs(DB_DIR, exist_ok=True)
+AUTH_DB = os.path.join(DB_DIR, "users.sqlite3")
+DATA_LOCK = threading.RLock()
+logging.basicConfig(filename=os.path.join(DB_DIR, "erp.log"), level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
+def auth_conn():
+    conn = sqlite3.connect(AUTH_DB, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, salt BLOB NOT NULL, password_hash BLOB NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)")
+    conn.commit()
+    return conn
+
+def password_hash(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310000)
+
+def init_audit_table():
+    with auth_conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT
+        )""")
+        conn.commit()
+
+def _json_safe(value):
+    if value is None:
+        return None
+    if isinstance(value, pd.DataFrame):
+        value = value.to_dict(orient="records")
+    elif isinstance(value, pd.Series):
+        value = value.to_dict()
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+def audit_log(action, entity_type, entity_id, old_value=None, new_value=None):
+    init_audit_table()
+    with auth_conn() as conn:
+        conn.execute(
+            "INSERT INTO audit_log(created_at,username,action,entity_type,entity_id,old_value,new_value) VALUES(?,?,?,?,?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), st.session_state.get("username", "system"),
+             action, entity_type, str(entity_id), _json_safe(old_value), _json_safe(new_value))
+        )
+        conn.commit()
+
+def load_audit_log(limit=1000):
+    init_audit_table()
+    with auth_conn() as conn:
+        return pd.read_sql_query(
+            "SELECT id,created_at,username,action,entity_type,entity_id,old_value,new_value FROM audit_log ORDER BY id DESC LIMIT ?",
+            conn, params=(limit,)
+        )
+
+def create_user(username, password, role="personel"):
+    username = username.strip()
+    if not username or len(password) < 12:
+        raise ValueError("Kullanıcı adı zorunlu; şifre en az 12 karakter olmalı.")
+    salt = secrets.token_bytes(16)
+    with auth_conn() as conn:
+        conn.execute("INSERT INTO users(username,salt,password_hash,role,active,created_at) VALUES(?,?,?,?,1,?)",
+                     (username, salt, password_hash(password, salt), role, datetime.now().isoformat(timespec="seconds")))
+
+def user_count():
+    with auth_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+def authenticate(username, password):
+    with auth_conn() as conn:
+        row = conn.execute("SELECT salt,password_hash,role,active FROM users WHERE username=?", (username.strip(),)).fetchone()
+    if not row or not row[3]:
+        return None
+    return row[2] if hmac.compare_digest(password_hash(password, row[0]), row[1]) else None
+
+def check_password():
+    if user_count() == 0:
+        st.subheader("🔐 İlk Kurulum — Yönetici Hesabı")
+        st.info("İlk açılışta yönetici hesabı oluştur. Şifren en az 12 karakter olmalı.")
+        with st.form("initial_admin_form"):
+            username = st.text_input("Yönetici kullanıcı adı", value="admin")
+            password = st.text_input("Yönetici şifresi", type="password")
+            confirm = st.text_input("Şifreyi tekrar gir", type="password")
+            submitted = st.form_submit_button("Yönetici Hesabını Oluştur")
+        if submitted:
+            if password != confirm:
+                st.error("Şifreler eşleşmiyor.")
             else:
-                st.error("Hatalı kullanıcı adı veya şifre!")
+                try:
+                    create_user(username, password, "admin")
+                    st.success("Yönetici hesabı oluşturuldu. Şimdi giriş yapabilirsin.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Hesap oluşturulamadı: {exc}")
+        return False
+    if not st.session_state.get("authenticated", False):
+        st.subheader("🔐 THE DIŞ TİCARET - ERP Giriş Paneli")
+        with st.form("login_form"):
+            username = st.text_input("Kullanıcı adı")
+            password = st.text_input("Şifre", type="password")
+            submitted = st.form_submit_button("Giriş Yap")
+        if submitted:
+            role = authenticate(username, password)
+            if role:
+                st.session_state.update(authenticated=True, username=username.strip(), role=role)
+                logging.info("LOGIN user=%s", username.strip())
+                st.rerun()
+            st.error("Kullanıcı adı veya şifre hatalı; hesap pasif olabilir.")
         return False
     return True
 
@@ -30,7 +136,6 @@ if not check_password():
 
 # --- BURADAN SONRASI ERP KODLARIN ---
 
-st.set_page_config(page_title="THE DIŞ TİCARET - Üretim and Stok Yönetimi", page_icon="🏭", layout="wide")
 
 DB_DIR = "data"
 PHOTO_DIR = os.path.join(DB_DIR, "production_photos")
@@ -65,15 +170,39 @@ def load_data(filepath, columns):
                 df = df[df["StokKodu"].astype(str).str.strip() != ""]
                 df = df[df["StokKodu"].astype(str).str.lower() != "bilinmiyor"]
             return df
-        except Exception:
-            return pd.DataFrame(columns=columns)
+        except Exception as exc:
+            # Bozuk dosyayı boş tablo gibi göstermeyiz; yanlışlıkla üzerine yazılmasını önleriz.
+            logging.exception("DATA_READ_ERROR file=%s", filepath)
+            raise RuntimeError(f"Veri dosyası okunamadı: {filepath}. Dosya korunuyor; yedekten kontrol edin.") from exc
     return pd.DataFrame(columns=columns)
 
 def save_data(df, filepath):
-    df.to_csv(filepath, index=False)
+    """CSV'yi aynı dizinde geçici dosyaya yazıp atomik olarak değiştirir."""
+    directory = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(directory, exist_ok=True)
+    with DATA_LOCK:
+        # Günlük ilk değişiklikten önce dosyanın bir kopyasını sakla.
+        if os.path.exists(filepath):
+            backup_dir = os.path.join(DB_DIR, "backups", datetime.now().strftime("%Y-%m-%d"))
+            os.makedirs(backup_dir, exist_ok=True)
+            backup_path = os.path.join(backup_dir, os.path.basename(filepath) + ".bak")
+            if not os.path.exists(backup_path):
+                import shutil
+                shutil.copy2(filepath, backup_path)
+        fd, tmp_path = tempfile.mkstemp(prefix=".erp_", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as handle:
+                df.to_csv(handle, index=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, filepath)
+            logging.info("DATA_SAVE user=%s file=%s rows=%s", st.session_state.get("username","system"), os.path.basename(filepath), len(df))
+        except Exception:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+            raise
 
 st.title("THE DIŞ TİCARET - ERP Stok and Üretim Yönetim Sistemi")
-st.markdown("Sevkiyat detaylı Excel döküm özelliği güncellendi canım! ✨")
 
 menu = [
     "1. Stok Kartı Tanımlama", 
@@ -81,17 +210,43 @@ menu = [
     "3. Cari dan Ürün Spek Yönetimi",
     "4. Üretime Sevk / Reçeteli Üretim and Maliyet",
     "5. Stok Durumu, Hareket Panosu and Föy Düzenleme",
-    "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)"
+    "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)",
+    "7. İzlenebilirlik & İşlem Geçmişi"
 ]
 choice = st.sidebar.radio("📋 ERP Modülleri", menu)
 
 st.sidebar.markdown("---")
-if st.sidebar.button("🧹 Tüm Verileri Sıfırla / Temizle"):
-    for f_path in [MASTER_ITEMS_FILE, STOCK_TRANSACTIONS_FILE, PRODUCTION_META_FILE, SHIPMENT_META_FILE, CARILER_FILE, SPEK_FILE]:
-        if os.path.exists(f_path):
-            os.remove(f_path)
-    st.sidebar.success("Tüm veriler sıfırlandı! Sayfayı yenileyebilirsin.")
+st.sidebar.caption(f"Oturum: {st.session_state.get('username','')} ({st.session_state.get('role','')})")
+if st.sidebar.button("Çıkış Yap"):
+    logging.info("LOGOUT user=%s", st.session_state.get("username",""))
+    for key in ("authenticated", "username", "role"):
+        st.session_state.pop(key, None)
     st.rerun()
+
+if st.session_state.get("role") == "admin":
+    with st.sidebar.expander("👥 Kullanıcı Yönetimi"):
+        with st.form("add_user_form", clear_on_submit=True):
+            new_username = st.text_input("Yeni kullanıcı adı")
+            new_password = st.text_input("Geçici/ilk şifre (min. 12 karakter)", type="password")
+            new_role = st.selectbox("Rol", ["personel", "admin"])
+            add_user = st.form_submit_button("Kullanıcı Oluştur")
+        if add_user:
+            try:
+                create_user(new_username, new_password, new_role)
+                logging.info("USER_CREATE by=%s user=%s role=%s", st.session_state.get("username"), new_username.strip(), new_role)
+                st.success("Kullanıcı oluşturuldu.")
+            except sqlite3.IntegrityError:
+                st.error("Bu kullanıcı adı zaten kayıtlı.")
+            except Exception as exc:
+                st.error(str(exc))
+    with st.sidebar.expander("⚠️ Tehlikeli işlemler"):
+        confirm_reset = st.checkbox("Tüm CSV verilerini silmeyi onaylıyorum")
+        if st.button("Tüm Verileri Sıfırla", disabled=not confirm_reset):
+            for f_path in [MASTER_ITEMS_FILE, STOCK_TRANSACTIONS_FILE, PRODUCTION_META_FILE, SHIPMENT_META_FILE, CARILER_FILE, SPEK_FILE]:
+                if os.path.exists(f_path): os.remove(f_path)
+            logging.warning("DATA_RESET by=%s", st.session_state.get("username"))
+            st.success("CSV verileri silindi.")
+            st.rerun()
 
 # --- 1. STOK KARTI TANIMLAMA ---
 if choice == "1. Stok Kartı Tanımlama":
@@ -217,6 +372,7 @@ elif choice == "2. Depo / Malzeme Girişi":
                         tx_df = load_data(STOCK_TRANSACTIONS_FILE, new_tx.columns.tolist())
                         tx_df = pd.concat([tx_df, new_tx], ignore_index=True)
                         save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                        audit_log("OLUŞTURMA", "DEPO_GIRISI", parti_no.strip(), new_value=new_tx)
                         st.success(f"Depo girişi başarıyla işlendi! ({default_depo} - Parti No: {parti_no})")
 
     st.subheader("📑 Son Yapılan Depo Giriş Hareketleri ve Silme")
@@ -242,8 +398,10 @@ elif choice == "2. Depo / Malzeme Girişi":
                 if not cikis_kontrol.empty:
                     st.error(f"🚨 Bu parti ({silinecek_parti}) için daha sonra üretime sevk veya çıkış yapılmış! Önce ilgili çıkışları veya üretim föyünü silmelisiniz.")
                 else:
+                    silinen_depo_kaydi = tx_history[((tx_history["PartiNo"].astype(str).str.strip() == silinecek_parti) & (tx_history["HareketTuru"] == "Giriş"))].copy()
                     tx_history = tx_history[~((tx_history["PartiNo"].astype(str).str.strip() == silinecek_parti) & (tx_history["HareketTuru"] == "Giriş"))]
                     save_data(tx_history, STOCK_TRANSACTIONS_FILE)
+                    audit_log("SILME", "DEPO_GIRISI", silinecek_parti, old_value=silinen_depo_kaydi)
                     st.success(f"'{silinecek_parti}' nolu depo giriş hareketi silindi!")
                     st.rerun()
 
@@ -684,6 +842,10 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                             new_tx_df = pd.DataFrame(yeni_hareketler)
                             tx_df = pd.concat([tx_df, new_tx_df], ignore_index=True)
                             save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                            audit_log("OLUŞTURMA", "URETIM", is_emri_no.strip(), new_value={
+                                "hareketler": yeni_hareketler,
+                                "meta": new_meta.to_dict(orient="records")
+                            })
                             
                             st.success(f"🎉 Üretim föyü, parti bazlı sarfiyatlar and 2. kalite fire girişleri başarıyla kaydedildi!")
 
@@ -832,9 +994,11 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
 
                         if sil_pressed:
                             mask_mamul = (tx_df["PartiNo"].astype(str) == str(secilen_is_emri)) & (tx_df["Tedarikci"] == "Dahili Üretim")
-                            mask_sarf_fire = tx_df["Tedarikci"].astype(str).str.contains(str(secilen_is_emri)) | (tx_df["PartiNo"].astype(str) == f"{secilen_is_emri}-FIRE")
+                            mask_sarf_fire = tx_df["Tedarikci"].astype(str).str.contains(str(secilen_is_emri), regex=False) | (tx_df["PartiNo"].astype(str) == f"{secilen_is_emri}-FIRE")
+                            silinen_uretim = tx_df[mask_mamul | mask_sarf_fire].copy()
                             tx_df = tx_df[~(mask_mamul | mask_sarf_fire)]
                             save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                            audit_log("SILME", "URETIM", secilen_is_emri, old_value=silinen_uretim)
                             st.success(f"✅ '{secilen_is_emri}' nolu iş emri silindi and tüm hareketler iptal edildi!")
                             st.rerun()
 
@@ -847,6 +1011,10 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                             elif not secilen_yeni_recete:
                                 st.error("En az bir adet hammadde sarfiyatı seçilmelidir!")
                             else:
+                                eski_uretim_snapshot = {
+                                    "hareketler": pd.concat([mevcut_sarfiyatlar, mevcut_fireler, pd.DataFrame([mamul_satir])], ignore_index=True).to_dict(orient="records"),
+                                    "meta": meta_row.to_dict(orient="records")
+                                }
                                 mask_mamul_eski = (tx_df["PartiNo"].astype(str) == str(secilen_is_emri)) & (tx_df["Tedarikci"] == "Dahili Üretim")
                                 mask_sarf_eski = tx_df["Tedarikci"].astype(str).str.contains(str(secilen_is_emri))
                                 mask_fire_eski = tx_df["PartiNo"].astype(str) == f"{secilen_is_emri}-FIRE"
@@ -964,6 +1132,10 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     }])
                                     meta_df = pd.concat([meta_df, new_meta], ignore_index=True)
                                     save_data(meta_df, PRODUCTION_META_FILE)
+                                    audit_log("GUNCELLEME", "URETIM", secilen_is_emri, old_value=eski_uretim_snapshot, new_value={
+                                        "hareketler": yeni_eklenen_hareketler,
+                                        "meta": new_meta.to_dict(orient="records")
+                                    })
 
                                     st.success(f"✨ '{secilen_is_emri}' nolu üretim föyü başarıyla güncellendi!")
                                     st.rerun()
@@ -976,21 +1148,32 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
         depo_listesi = ["Tümü"] + list(tx_df["Depo"].unique())
         secilen_depo_filtre = st.selectbox("📂 Depo Filtrele", depo_listesi)
         
-        if secilen_depo_filtre != "Tümü":
-            fiyat_hesap_df = tx_df[(tx_df["Depo"] == secilen_depo_filtre) & (tx_df["HareketTuru"] == "Giriş")]
-        else:
-            fiyat_hesap_df = tx_df[tx_df["HareketTuru"] == "Giriş"]
-            
-        toplam_envanter_maliyeti = fiyat_hesap_df["ToplamTutar"].sum() if not fiyat_hesap_df.empty else 0.0
-        
+        # Güncel stok değerini lot bazında hesapla: kalan miktar x lotun giriş/üretim birim maliyeti.
+        # Böylece daha önce çıkmış/sevk edilmiş malların bedeli stok değerine dahil edilmez.
+        giris_deger_df = tx_df[tx_df["HareketTuru"] == "Giriş"].copy()
+        cikis_deger_df = tx_df[tx_df["HareketTuru"] == "Çıkış"].copy()
+        kalan_stok_degeri = 0.0
+        kalan_lot_adedi = 0
+        for _, g_row in giris_deger_df.iterrows():
+            s_kod = str(g_row["StokKodu"])
+            p_no = str(g_row["PartiNo"]).strip()
+            depo = str(g_row["Depo"])
+            if secilen_depo_filtre != "Tümü" and depo != secilen_depo_filtre:
+                continue
+            cikan = cikis_deger_df[(cikis_deger_df["StokKodu"].astype(str) == s_kod) &
+                                   (cikis_deger_df["PartiNo"].astype(str).str.strip() == p_no)]["Miktar"].sum()
+            kalan = max(float(g_row["Miktar"]) - float(cikan), 0.0)
+            if kalan > 0:
+                kalan_stok_degeri += kalan * float(g_row["BirimFiyat"])
+                kalan_lot_adedi += 1
+
         st.markdown("---")
         col_kpi1, col_kpi2 = st.columns(2)
         with col_kpi1:
             depo_etiketi = secilen_depo_filtre if secilen_depo_filtre != "Tümü" else "Tüm Depolar"
-            st.metric(label=f"💰 Seçilen Alan Toplam Giriş Maliyeti ({depo_etiketi})", value=f"{toplam_envanter_maliyeti:,.2f} TL")
+            st.metric(label=f"💰 Depoda Kalan Malların Bedeli ({depo_etiketi})", value=f"{kalan_stok_degeri:,.2f} TL")
         with col_kpi2:
-            toplam_islem_adedi = len(fiyat_hesap_df)
-            st.metric(label="📦 Toplam Giriş Fişi / Lot Sayısı", value=f"{toplam_islem_adedi:,} Adet")
+            st.metric(label="📦 Stokta Kalan Lot Sayısı", value=f"{kalan_lot_adedi:,} Adet")
         st.markdown("---")
 
         temp_all = tx_df.copy()
@@ -1050,6 +1233,32 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 file_name=f"stok_durumu_{secilen_depo_filtre}.xls",
                 mime="application/vnd.ms-excel"
             )
+
+        # Stok kartı bazında tüm giriş / çıkış hareketleri
+        st.markdown("---")
+        st.subheader("🔎 Stok Kartı Bazlı Giriş / Çıkış Hareketleri")
+        stok_kartlari = (tx_df[["StokKodu", "StokAdi"]].drop_duplicates()
+                         .sort_values(["StokKodu", "StokAdi"]))
+        stok_kart_secenekleri = [f"{r['StokKodu']} - {r['StokAdi']}" for _, r in stok_kartlari.iterrows()]
+        if stok_kart_secenekleri:
+            secilen_stok_kart = st.selectbox("Stok Kartı Seç", stok_kart_secenekleri, key="stok_karti_hareket_sec")
+            secilen_stok_kodu = secilen_stok_kart.split(" - ", 1)[0].strip()
+            kart_hareketleri = tx_df[tx_df["StokKodu"].astype(str) == secilen_stok_kodu].copy()
+            kart_hareketleri["Giriş Miktarı"] = kart_hareketleri.apply(lambda r: r["Miktar"] if r["HareketTuru"] == "Giriş" else 0.0, axis=1)
+            kart_hareketleri["Çıkış Miktarı"] = kart_hareketleri.apply(lambda r: r["Miktar"] if r["HareketTuru"] == "Çıkış" else 0.0, axis=1)
+            toplam_giris = kart_hareketleri["Giriş Miktarı"].sum()
+            toplam_cikis = kart_hareketleri["Çıkış Miktarı"].sum()
+            net_stok = toplam_giris - toplam_cikis
+            birim = str(kart_hareketleri.iloc[0]["Birim"]) if not kart_hareketleri.empty else ""
+            hk1, hk2, hk3 = st.columns(3)
+            hk1.metric("⬇️ Toplam Giriş", f"{toplam_giris:,.2f} {birim}")
+            hk2.metric("⬆️ Toplam Çıkış", f"{toplam_cikis:,.2f} {birim}")
+            hk3.metric("📦 Net Stok", f"{net_stok:,.2f} {birim}")
+            gosterim_kolonlari = ["Tarih", "HareketTuru", "Depo", "PartiNo", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "Tedarikci", "Aciklama"]
+            kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
+            st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}", "BirimFiyat":"{:,.2f} TL", "ToplamTutar":"{:,.2f} TL"}), use_container_width=True)
+        else:
+            st.info("Stok kartı hareketi bulunmuyor.")
 
 # --- 6. SEVKİYAT & ÇIKIŞ YÖNETİMİ (İLÇE TARIM & FOTO) ---
 elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
@@ -1215,9 +1424,35 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
 
                             tx_df = pd.concat([tx_df, pd.DataFrame(yeni_sevk_hareketleri)], ignore_index=True)
                             save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                            audit_log("OLUŞTURMA", "SEVKIYAT", irsaliye_sevkiyat_no.strip(), new_value={
+                                "hareketler": yeni_sevk_hareketleri,
+                                "meta": new_ship_meta.to_dict(orient="records")
+                            })
 
                             st.success(f"🎉 Sevkiyat başarıyla gerçekleştirildi, fiyatlandırma işlendi, stoktan düşüldü, İlçe Tarım belgesi ve sevkiyat fotoğrafı arşivlendi!")
 
+    # Müşteri sevkiyatlarından oluşan satış cirosu
+    st.markdown("---")
+    st.subheader("💰 Sevkiyat Ciro Özeti")
+    sevk_ciro_df = tx_df[(tx_df["HareketTuru"] == "Çıkış") &
+                         (tx_df["Tedarikci"].astype(str).str.startswith("Müşteri Sevkiyat:", na=False))].copy()
+    toplam_ciro = sevk_ciro_df["ToplamTutar"].sum() if not sevk_ciro_df.empty else 0.0
+    sevk_irsaliyeler = load_data(SHIPMENT_META_FILE, ["IrsaliyeNo", "MusteriAdi", "SevkFotoYolu", "IlceTarimDocYolu", "Notlar"])
+    irsaliye_adedi = sevk_irsaliyeler["IrsaliyeNo"].astype(str).nunique() if not sevk_irsaliyeler.empty else 0
+    ortalama_irsaliye = toplam_ciro / irsaliye_adedi if irsaliye_adedi else 0.0
+    ck1, ck2, ck3 = st.columns(3)
+    ck1.metric("💵 Toplam Sevkiyat Cirosu", f"{toplam_ciro:,.2f} TL")
+    ck2.metric("🚚 Sevkiyat / İrsaliye Sayısı", f"{irsaliye_adedi:,}")
+    ck3.metric("📊 Ortalama İrsaliye Tutarı", f"{ortalama_irsaliye:,.2f} TL")
+    if not sevk_ciro_df.empty:
+        sevk_ciro_df["Müşteri"] = sevk_ciro_df["Tedarikci"].astype(str).str.replace("Müşteri Sevkiyat:", "", regex=False).str.strip()
+        musteri_ciro = sevk_ciro_df.groupby("Müşteri", as_index=False)["ToplamTutar"].sum()
+        musteri_ciro.columns = ["Müşteri", "Ciro (TL)"]
+        musteri_ciro = musteri_ciro.sort_values("Ciro (TL)", ascending=False)
+        st.markdown("**Müşteri Bazlı Ciro**")
+        st.dataframe(musteri_ciro.style.format({"Ciro (TL)":"{:,.2f} TL"}), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
     st.subheader("📋 Kayıtlı Sevkiyatlar and Arşiv (İlçe Tarım, Fiyatlar, Fotoğraflar & İptal/Silme)")
     meta_ship_df = load_data(SHIPMENT_META_FILE, ["IrsaliyeNo", "MusteriAdi", "SevkFotoYolu", "IlceTarimDocYolu", "Notlar"])
     
@@ -1351,11 +1586,134 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                 if st.button(f"🗑️ Bu Sevkiyatı (İrsaliye: {s_row['IrsaliyeNo']}) İptal Et & Sil", key=f"del_ship_{idx}"):
                     tx_df = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
                     irs_no = str(s_row['IrsaliyeNo']).strip()
-                    tx_df = tx_df[~((tx_df["HareketTuru"] == "Çıkış") & (tx_df["Aciklama"].astype(str).str.contains(irs_no)))]
+                    sevk_mask = (tx_df["HareketTuru"] == "Çıkış") & (tx_df["Aciklama"].astype(str).str.contains(irs_no, regex=False))
+                    silinen_sevk_hareketleri = tx_df[sevk_mask].copy()
+                    silinen_sevk_meta = meta_ship_df[meta_ship_df["IrsaliyeNo"].astype(str) == irs_no].copy()
+                    tx_df = tx_df[~sevk_mask]
                     save_data(tx_df, STOCK_TRANSACTIONS_FILE)
                     
                     meta_ship_df = meta_ship_df[meta_ship_df["IrsaliyeNo"].astype(str) != irs_no]
                     save_data(meta_ship_df, SHIPMENT_META_FILE)
+                    audit_log("SILME", "SEVKIYAT", irs_no, old_value={
+                        "hareketler": silinen_sevk_hareketleri.to_dict(orient="records"),
+                        "meta": silinen_sevk_meta.to_dict(orient="records")
+                    })
                     
                     st.success(f"✅ İrsaliye {irs_no} nolu sevkiyat silindi ve ürünler tekrar stoğa iade edildi!")
                     st.rerun()
+
+# --- 7. İZLENEBİLİRLİK & İŞLEM GEÇMİŞİ ---
+elif choice == "7. İzlenebilirlik & İşlem Geçmişi":
+    st.header("🔎 Lot İzlenebilirliği & İşlem Geçmişi")
+    tab_trace, tab_audit = st.tabs(["🔗 Lot / Üretim / Sevkiyat Zinciri", "🧾 Kullanıcı İşlem Geçmişi"])
+
+    with tab_trace:
+        tx_trace = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
+        ship_trace = load_data(SHIPMENT_META_FILE, ["IrsaliyeNo", "MusteriAdi", "SevkFotoYolu", "IlceTarimDocYolu", "Notlar"])
+        arama = st.text_input("Lot / parti, iş emri (mamul lotu) veya irsaliye numarası ara", placeholder="Örn: LOT-2026-15, URT-2026-041 veya IRS-2026-001").strip()
+
+        if arama:
+            # İrsaliye girildiyse önce sevk edilen mamul lotlarını bul.
+            ship_meta_match = ship_trace[ship_trace["IrsaliyeNo"].astype(str).str.strip() == arama] if not ship_trace.empty else pd.DataFrame()
+            if not ship_meta_match.empty:
+                shipment_rows = tx_trace[(tx_trace["HareketTuru"] == "Çıkış") & tx_trace["Aciklama"].astype(str).str.contains(arama, regex=False)]
+                hedef_mamul_lotlari = shipment_rows["PartiNo"].astype(str).str.strip().unique().tolist()
+            else:
+                shipment_rows = pd.DataFrame()
+                hedef_mamul_lotlari = []
+
+            # Arama bir hammadde lotu ise onu tüketen iş emirlerini bul.
+            raw_usage = tx_trace[(tx_trace["HareketTuru"] == "Çıkış") & (tx_trace["PartiNo"].astype(str).str.strip() == arama) & tx_trace["Tedarikci"].astype(str).str.startswith("İş Emri:")]
+            is_emirleri = []
+            for val in raw_usage["Tedarikci"].astype(str).tolist():
+                no = val.split("İş Emri:", 1)[1].strip()
+                if no and no not in is_emirleri:
+                    is_emirleri.append(no)
+
+            # Arama doğrudan bir mamul lotu / iş emri ise zincire ekle.
+            direct_mamul = tx_trace[(tx_trace["HareketTuru"] == "Giriş") & (tx_trace["Depo"] == "Mamül Deposu") & (tx_trace["PartiNo"].astype(str).str.strip() == arama)]
+            if not direct_mamul.empty and arama not in is_emirleri:
+                is_emirleri.append(arama)
+            for lot in hedef_mamul_lotlari:
+                if lot not in is_emirleri:
+                    is_emirleri.append(lot)
+
+            # İş emrinden geriye doğru hammadde lotlarını ve ileri doğru sevkiyatları topla.
+            hammaddeler = []
+            mamuller = []
+            sevkiyatlar = []
+            for is_no in is_emirleri:
+                sarflar = tx_trace[(tx_trace["HareketTuru"] == "Çıkış") & (tx_trace["Tedarikci"].astype(str).str.strip() == f"İş Emri: {is_no}")]
+                for _, r in sarflar.iterrows():
+                    hammaddeler.append(r.to_dict())
+                mamul_rows = tx_trace[(tx_trace["HareketTuru"] == "Giriş") & (tx_trace["Depo"] == "Mamül Deposu") & (tx_trace["PartiNo"].astype(str).str.strip() == is_no)]
+                for _, r in mamul_rows.iterrows():
+                    mamuller.append(r.to_dict())
+                sevk_rows = tx_trace[(tx_trace["HareketTuru"] == "Çıkış") & (tx_trace["Depo"] == "Mamül Deposu") & (tx_trace["PartiNo"].astype(str).str.strip() == is_no) & tx_trace["Tedarikci"].astype(str).str.startswith("Müşteri Sevkiyat:")]
+                for _, r in sevk_rows.iterrows():
+                    rec = r.to_dict()
+                    rec["Musteri"] = str(r["Tedarikci"]).split("Müşteri Sevkiyat:", 1)[1].strip()
+                    acik = str(r["Aciklama"])
+                    rec["IrsaliyeNo"] = acik.split("İrsaliye:", 1)[1].split(".", 1)[0].strip() if "İrsaliye:" in acik else ""
+                    sevkiyatlar.append(rec)
+
+            # Arama yalnızca mevcut bir hammadde lotuysa giriş bilgisini de göster.
+            hammadde_giris = tx_trace[(tx_trace["HareketTuru"] == "Giriş") & (tx_trace["PartiNo"].astype(str).str.strip() == arama)]
+            if not raw_usage.empty or is_emirleri or not ship_meta_match.empty or not hammadde_giris.empty:
+                st.success("İzlenebilirlik kaydı bulundu.")
+                if not hammadde_giris.empty and arama not in is_emirleri:
+                    st.subheader("1️⃣ Hammadde / Giriş Lotu")
+                    st.dataframe(hammadde_giris[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                if hammaddeler:
+                    st.subheader("1️⃣ Kullanılan Hammadde Lotları")
+                    hdf = pd.DataFrame(hammaddeler)
+                    st.dataframe(hdf[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                if is_emirleri:
+                    st.subheader("2️⃣ Üretim İş Emri / Mamul Lotu")
+                    st.write(" → ".join(is_emirleri))
+                if mamuller:
+                    mdf = pd.DataFrame(mamuller)
+                    st.dataframe(mdf[["Tarih","StokKodu","StokAdi","PartiNo","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                if sevkiyatlar:
+                    st.subheader("3️⃣ Müşteri / İrsaliye / Sevkiyat")
+                    sdf = pd.DataFrame(sevkiyatlar)
+                    st.dataframe(sdf[["Tarih","StokKodu","StokAdi","PartiNo","Musteri","IrsaliyeNo","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                else:
+                    st.info("Bu zincire bağlı müşteri sevkiyatı henüz bulunmuyor.")
+            else:
+                st.warning("Bu numarayla eşleşen lot, iş emri veya irsaliye bulunamadı.")
+        else:
+            st.info("Bir lot, iş emri veya irsaliye numarası girerek uçtan uca izlenebilirliği görüntüleyebilirsin.")
+
+    with tab_audit:
+        audit_df = load_audit_log(2000)
+        if audit_df.empty:
+            st.info("Henüz audit kaydı oluşmadı. Bu güncellemeden sonraki kritik işlemler burada görünecek.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                user_filter = st.selectbox("Kullanıcı", ["Tümü"] + sorted(audit_df["username"].dropna().astype(str).unique().tolist()))
+            with c2:
+                type_filter = st.selectbox("İşlem alanı", ["Tümü"] + sorted(audit_df["entity_type"].dropna().astype(str).unique().tolist()))
+            with c3:
+                action_filter = st.selectbox("İşlem", ["Tümü"] + sorted(audit_df["action"].dropna().astype(str).unique().tolist()))
+            view = audit_df.copy()
+            if user_filter != "Tümü": view = view[view["username"] == user_filter]
+            if type_filter != "Tümü": view = view[view["entity_type"] == type_filter]
+            if action_filter != "Tümü": view = view[view["action"] == action_filter]
+            display = view.rename(columns={"created_at":"Tarih/Saat","username":"Kullanıcı","action":"İşlem","entity_type":"Alan","entity_id":"Kayıt No"})
+            st.dataframe(display[["Tarih/Saat","Kullanıcı","İşlem","Alan","Kayıt No"]], use_container_width=True, hide_index=True)
+            st.markdown("### İşlem Detayı")
+            detail_ids = view["id"].tolist()
+            if detail_ids:
+                selected_id = st.selectbox("Detayını görmek istediğin kayıt", detail_ids, format_func=lambda x: f"#{x}")
+                drow = view[view["id"] == selected_id].iloc[0]
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    st.markdown("**Önceki değer**")
+                    try: st.json(json.loads(drow["old_value"]) if drow["old_value"] else {})
+                    except Exception: st.code(str(drow["old_value"] or ""))
+                with dc2:
+                    st.markdown("**Yeni değer**")
+                    try: st.json(json.loads(drow["new_value"]) if drow["new_value"] else {})
+                    except Exception: st.code(str(drow["new_value"] or ""))
