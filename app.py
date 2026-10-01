@@ -1314,21 +1314,29 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
         st.markdown("---")
 
         temp_all = tx_df.copy()
-        temp_all["NetMiktar"] = temp_all.apply(lambda row: row["Miktar"] if row["HareketTuru"] == "Giriş" else -row["Miktar"], axis=1)
-        global_summary_df = temp_all.groupby(["StokKodu", "StokAdi", "Depo", "Birim"])["NetMiktar"].sum().reset_index()
-        global_summary_df.columns = ["Stok Kodu", "Stok Adı", "Depo", "Birim", "Net Miktar"]
+        temp_all["Toplam Giriş"] = temp_all.apply(lambda row: row["Miktar"] if row["HareketTuru"] == "Giriş" else 0.0, axis=1)
+        temp_all["Toplam Çıkış"] = temp_all.apply(lambda row: row["Miktar"] if row["HareketTuru"] == "Çıkış" else 0.0, axis=1)
+        global_summary_df = (
+            temp_all.groupby(["StokKodu", "StokAdi", "Depo", "Birim"])[["Toplam Giriş", "Toplam Çıkış"]]
+            .sum()
+            .reset_index()
+        )
+        global_summary_df["Net Kalan"] = global_summary_df["Toplam Giriş"] - global_summary_df["Toplam Çıkış"]
+        global_summary_df.columns = ["Stok Kodu", "Stok Adı", "Depo", "Birim", "Toplam Giriş", "Toplam Çıkış", "Net Kalan"]
         
         if secilen_depo_filtre != "Tümü":
             summary_df = global_summary_df[global_summary_df["Depo"] == secilen_depo_filtre]
         else:
             summary_df = global_summary_df.copy()
             
-        st.subheader("📦 Seçilen Depodaki Güncel Net Stoklar")
+        st.subheader("📦 Stok Kartı Bazlı Giriş / Çıkış / Net Kalan Özeti")
         if summary_df.empty:
             st.info("Bu depoda henüz stok hareketi bulunmuyor.")
         else:
             styled_summary = summary_df.style.format({
-                "Net Miktar": "{:,.2f}"
+                "Toplam Giriş": "{:,.2f}",
+                "Toplam Çıkış": "{:,.2f}",
+                "Net Kalan": "{:,.2f}"
             })
             st.dataframe(styled_summary, use_container_width=True)
             
