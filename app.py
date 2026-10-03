@@ -6,7 +6,9 @@ from PIL import Image
 from io import BytesIO
 
 # --- GÜVENLİ GİRİŞ / KULLANICI YÖNETİMİ ---
-import sqlite3
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import Json
 import hashlib
 import hmac
 import secrets
@@ -14,39 +16,101 @@ import tempfile
 import threading
 import logging
 import json
+import requests
+from urllib.parse import quote
+import posixpath
+from pathlib import Path
 
 st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
 
 DB_DIR = "data"
 os.makedirs(DB_DIR, exist_ok=True)
-AUTH_DB = os.path.join(DB_DIR, "users.sqlite3")
 DATA_LOCK = threading.RLock()
 logging.basicConfig(filename=os.path.join(DB_DIR, "erp.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
+def pg_conn():
+    """Streamlit Secrets üzerinden Supabase PostgreSQL bağlantısı açar."""
+    try:
+        cfg = st.secrets["postgres"]
+        return psycopg2.connect(
+            host=cfg["host"],
+            port=int(cfg.get("port", 5432)),
+            dbname=cfg.get("database", "postgres"),
+            user=cfg["user"],
+            password=cfg["password"],
+            sslmode="require",
+            connect_timeout=15,
+        )
+    except Exception as exc:
+        raise RuntimeError("Supabase/PostgreSQL bağlantısı kurulamadı. Streamlit Secrets ayarlarını kontrol edin.") from exc
+
+
+# --- SUPABASE STORAGE (özel bucket) ---
+def _storage_cfg():
+    try:
+        cfg = st.secrets["supabase"]
+        return str(cfg["url"]).rstrip("/"), str(cfg["service_key"]), str(cfg.get("bucket", "erp-files"))
+    except Exception as exc:
+        raise RuntimeError("Supabase Storage ayarları eksik. Streamlit Secrets içindeki [supabase] bölümünü kontrol edin.") from exc
+
+def _safe_storage_name(name):
+    name = os.path.basename(str(name or "dosya"))
+    return "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in name)
+
+def storage_upload(uploaded_file, folder, filename=None):
+    """Dosyayı private Supabase Storage bucket'a yükler ve object path döndürür."""
+    if uploaded_file is None:
+        return ""
+    base_url, key, bucket = _storage_cfg()
+    filename = _safe_storage_name(filename or uploaded_file.name)
+    object_path = f"{folder.strip('/')}/{filename}"
+    endpoint = f"{base_url}/storage/v1/object/{quote(bucket, safe='')}/{quote(object_path, safe='/')}"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+        "Content-Type": getattr(uploaded_file, "type", None) or "application/octet-stream",
+        "x-upsert": "false",
+    }
+    resp = requests.post(endpoint, headers=headers, data=uploaded_file.getvalue(), timeout=60)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}).")
+    return object_path
+
+def storage_download(object_path):
+    """Private Storage nesnesini byte olarak indirir."""
+    if not object_path:
+        return None
+    # Eski yerel kayıt varsa geçiş döneminde okumayı dene.
+    if os.path.exists(str(object_path)):
+        try:
+            return Path(str(object_path)).read_bytes()
+        except Exception:
+            return None
+    base_url, key, bucket = _storage_cfg()
+    endpoint = f"{base_url}/storage/v1/object/authenticated/{quote(bucket, safe='')}/{quote(str(object_path), safe='/')}"
+    headers = {"Authorization": f"Bearer {key}", "apikey": key}
+    resp = requests.get(endpoint, headers=headers, timeout=60)
+    if resp.status_code == 200:
+        return resp.content
+    return None
+
+def storage_filename(object_path):
+    return posixpath.basename(str(object_path or "dosya"))
+
+def storage_is_image(object_path):
+    return str(object_path or "").lower().split("?", 1)[0].endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
 def auth_conn():
-    conn = sqlite3.connect(AUTH_DB, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, salt BLOB NOT NULL, password_hash BLOB NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)")
-    conn.commit()
-    return conn
+    # Eski kodun geri kalanıyla uyumluluk için PostgreSQL bağlantısını döndürür.
+    return pg_conn()
 
 def password_hash(password, salt):
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310000)
 
 def init_audit_table():
-    with auth_conn() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
-            old_value TEXT,
-            new_value TEXT
-        )""")
-        conn.commit()
+    # Tablo Supabase ilk kurulum SQL'i ile oluşturuldu.
+    return None
 
 def _json_safe(value):
     if value is None:
@@ -55,24 +119,23 @@ def _json_safe(value):
         value = value.to_dict(orient="records")
     elif isinstance(value, pd.Series):
         value = value.to_dict()
-    return json.dumps(value, ensure_ascii=False, default=str)
+    return value
 
 def audit_log(action, entity_type, entity_id, old_value=None, new_value=None):
-    init_audit_table()
-    with auth_conn() as conn:
-        conn.execute(
-            "INSERT INTO audit_log(created_at,username,action,entity_type,entity_id,old_value,new_value) VALUES(?,?,?,?,?,?,?)",
-            (datetime.now().isoformat(timespec="seconds"), st.session_state.get("username", "system"),
-             action, entity_type, str(entity_id), _json_safe(old_value), _json_safe(new_value))
-        )
-        conn.commit()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'INSERT INTO public.audit_log(username,action,entity_type,entity_id,old_value,new_value) VALUES(%s,%s,%s,%s,%s,%s)',
+                (st.session_state.get("username", "system"), action, entity_type, str(entity_id),
+                 Json(_json_safe(old_value)) if old_value is not None else None,
+                 Json(_json_safe(new_value)) if new_value is not None else None)
+            )
 
 def load_audit_log(limit=1000):
-    init_audit_table()
-    with auth_conn() as conn:
+    with pg_conn() as conn:
         return pd.read_sql_query(
-            "SELECT id,created_at,username,action,entity_type,entity_id,old_value,new_value FROM audit_log ORDER BY id DESC LIMIT ?",
-            conn, params=(limit,)
+            'SELECT id,created_at,username,action,entity_type,entity_id,old_value,new_value FROM public.audit_log ORDER BY id DESC LIMIT %s',
+            conn, params=(int(limit),)
         )
 
 def create_user(username, password, role="personel"):
@@ -80,20 +143,29 @@ def create_user(username, password, role="personel"):
     if not username or len(password) < 12:
         raise ValueError("Kullanıcı adı zorunlu; şifre en az 12 karakter olmalı.")
     salt = secrets.token_bytes(16)
-    with auth_conn() as conn:
-        conn.execute("INSERT INTO users(username,salt,password_hash,role,active,created_at) VALUES(?,?,?,?,1,?)",
-                     (username, salt, password_hash(password, salt), role, datetime.now().isoformat(timespec="seconds")))
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'INSERT INTO public.erp_users(username,salt,password_hash,role,active) VALUES(%s,%s,%s,%s,TRUE)',
+                (username, psycopg2.Binary(salt), psycopg2.Binary(password_hash(password, salt)), role)
+            )
 
 def user_count():
-    with auth_conn() as conn:
-        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) FROM public.erp_users')
+            return cur.fetchone()[0]
 
 def authenticate(username, password):
-    with auth_conn() as conn:
-        row = conn.execute("SELECT salt,password_hash,role,active FROM users WHERE username=?", (username.strip(),)).fetchone()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT salt,password_hash,role,active FROM public.erp_users WHERE username=%s', (username.strip(),))
+            row = cur.fetchone()
     if not row or not row[3]:
         return None
-    return row[2] if hmac.compare_digest(password_hash(password, row[0]), row[1]) else None
+    salt = bytes(row[0])
+    stored_hash = bytes(row[1])
+    return row[2] if hmac.compare_digest(password_hash(password, salt), stored_hash) else None
 
 def check_password():
     if user_count() == 0:
@@ -158,49 +230,80 @@ SHIPMENT_META_FILE = os.path.join(DB_DIR, "shipment_meta.csv")
 CARILER_FILE = os.path.join(DB_DIR, "cariler.csv")
 SPEK_FILE = os.path.join(DB_DIR, "cari_urun_spekleri.csv")
 
+TABLE_BY_FILE = {
+    os.path.abspath(MASTER_ITEMS_FILE): "master_items",
+    os.path.abspath(STOCK_TRANSACTIONS_FILE): "stock_transactions",
+    os.path.abspath(PRODUCTION_META_FILE): "production_meta",
+    os.path.abspath(SHIPMENT_META_FILE): "shipment_meta",
+    os.path.abspath(CARILER_FILE): "cariler",
+    os.path.abspath(SPEK_FILE): "cari_urun_spekleri",
+}
+
+def _table_for_file(filepath):
+    table = TABLE_BY_FILE.get(os.path.abspath(filepath))
+    if not table:
+        raise ValueError(f"Bilinmeyen veri kaynağı: {filepath}")
+    return table
+
 def load_data(filepath, columns):
-    if os.path.exists(filepath):
+    """ERP verisini CSV yerine Supabase PostgreSQL'den okur."""
+    table = _table_for_file(filepath)
+    if not columns:
+        return pd.DataFrame()
+    query = sql.SQL("SELECT {} FROM public.{} ORDER BY created_at, ctid").format(
+        sql.SQL(', ').join(sql.Identifier(c) for c in columns),
+        sql.Identifier(table),
+    )
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+        df = pd.DataFrame(rows, columns=columns)
+        if "StokKodu" in df.columns and not df.empty:
+            df = df.dropna(subset=["StokKodu"])
+            df = df[df["StokKodu"].astype(str).str.strip() != ""]
+            df = df[df["StokKodu"].astype(str).str.lower() != "bilinmiyor"]
+        return df
+    except Exception as exc:
+        logging.exception("DB_READ_ERROR table=%s", table)
+        raise RuntimeError(f"Supabase verisi okunamadı: {table}") from exc
+
+def _pg_value(v):
+    if pd.isna(v):
+        return None
+    if hasattr(v, "item"):
         try:
-            df = pd.read_csv(filepath)
-            for col in columns:
-                if col not in df.columns:
-                    df[col] = ""
-            if "StokKodu" in df.columns:
-                df = df.dropna(subset=["StokKodu"])
-                df = df[df["StokKodu"].astype(str).str.strip() != ""]
-                df = df[df["StokKodu"].astype(str).str.lower() != "bilinmiyor"]
-            return df
-        except Exception as exc:
-            # Bozuk dosyayı boş tablo gibi göstermeyiz; yanlışlıkla üzerine yazılmasını önleriz.
-            logging.exception("DATA_READ_ERROR file=%s", filepath)
-            raise RuntimeError(f"Veri dosyası okunamadı: {filepath}. Dosya korunuyor; yedekten kontrol edin.") from exc
-    return pd.DataFrame(columns=columns)
+            return v.item()
+        except Exception:
+            pass
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    return v
 
 def save_data(df, filepath):
-    """CSV'yi aynı dizinde geçici dosyaya yazıp atomik olarak değiştirir."""
-    directory = os.path.dirname(os.path.abspath(filepath))
-    os.makedirs(directory, exist_ok=True)
+    """Mevcut DataFrame'i ilgili Supabase tablosuna tek transaction içinde yazar."""
+    table = _table_for_file(filepath)
+    df = df.copy()
+    # Sadece uygulamanın gönderdiği kolonları yazar; id/created_at DB tarafından yönetilir.
+    columns = list(df.columns)
     with DATA_LOCK:
-        # Günlük ilk değişiklikten önce dosyanın bir kopyasını sakla.
-        if os.path.exists(filepath):
-            backup_dir = os.path.join(DB_DIR, "backups", datetime.now().strftime("%Y-%m-%d"))
-            os.makedirs(backup_dir, exist_ok=True)
-            backup_path = os.path.join(backup_dir, os.path.basename(filepath) + ".bak")
-            if not os.path.exists(backup_path):
-                import shutil
-                shutil.copy2(filepath, backup_path)
-        fd, tmp_path = tempfile.mkstemp(prefix=".erp_", suffix=".tmp", dir=directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as handle:
-                df.to_csv(handle, index=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp_path, filepath)
-            logging.info("DATA_SAVE user=%s file=%s rows=%s", st.session_state.get("username","system"), os.path.basename(filepath), len(df))
-        except Exception:
-            try: os.unlink(tmp_path)
-            except OSError: pass
-            raise
+            with pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql.SQL("DELETE FROM public.{}").format(sql.Identifier(table)))
+                    if columns and not df.empty:
+                        insert_q = sql.SQL("INSERT INTO public.{} ({}) VALUES ({})").format(
+                            sql.Identifier(table),
+                            sql.SQL(', ').join(sql.Identifier(c) for c in columns),
+                            sql.SQL(', ').join(sql.Placeholder() for _ in columns),
+                        )
+                        for row in df.itertuples(index=False, name=None):
+                            cur.execute(insert_q, tuple(_pg_value(v) for v in row))
+            logging.info("DB_SAVE user=%s table=%s rows=%s", st.session_state.get("username","system"), table, len(df))
+        except Exception as exc:
+            logging.exception("DB_SAVE_ERROR table=%s", table)
+            raise RuntimeError(f"Supabase verisi kaydedilemedi: {table}") from exc
 
 # --- KURUMSAL ÜST BANT ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -281,12 +384,12 @@ if st.session_state.get("role") == "admin":
                 logging.info("USER_CREATE by=%s user=%s role=%s", st.session_state.get("username"), new_username.strip(), new_role)
                 audit_log("OLUŞTURMA", "KULLANICI", new_username.strip(), new_value={"rol": new_role})
                 st.success(f"Kullanıcı oluşturuldu: {ROLE_LABELS.get(new_role, new_role)}")
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
                 st.error("Bu kullanıcı adı zaten kayıtlı.")
             except Exception as exc:
                 st.error(str(exc))
     with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
-        st.caption("Sunucudaki data klasörünü kontrol eder ve varsa tek ZIP olarak indirir.")
+        st.caption("Sunucudaki yalnızca geçici log/cache dosyalarını gösterir. Ana ERP kayıtları PostgreSQL, belge ve fotoğraflar Supabase Storage içindedir.")
         import zipfile
         import glob
 
@@ -326,14 +429,9 @@ if st.session_state.get("role") == "admin":
         else:
             st.error("data klasörü bulunamadı.")
 
-    with st.sidebar.expander("⚠️ Tehlikeli işlemler"):
-        confirm_reset = st.checkbox("Tüm CSV verilerini silmeyi onaylıyorum")
-        if st.button("Tüm Verileri Sıfırla", disabled=not confirm_reset):
-            for f_path in [MASTER_ITEMS_FILE, STOCK_TRANSACTIONS_FILE, PRODUCTION_META_FILE, SHIPMENT_META_FILE, CARILER_FILE, SPEK_FILE]:
-                if os.path.exists(f_path): os.remove(f_path)
-            logging.warning("DATA_RESET by=%s", st.session_state.get("username"))
-            st.success("CSV verileri silindi.")
-            st.rerun()
+    with st.sidebar.expander("🛡️ Veri Güvenliği"):
+        st.success("Toplu veri silme kapatıldı. ERP kayıtları Supabase PostgreSQL'de, dosyalar private Supabase Storage'da tutulur.")
+        st.caption("Kritik silme işlemleri yalnızca ilgili kayıt ekranlarından kontrollü olarak yapılabilir.")
 
 # --- 1. STOK KARTI TANIMLAMA ---
 if choice == "0. Yönetici Dashboard":
@@ -667,16 +765,12 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                     spec_file_path = ""
                     if uploaded_spek_file is not None:
                         sf_name = f"{secilen_cari}_{st_kod}_{int(datetime.now().timestamp())}_{uploaded_spek_file.name}"
-                        spec_file_path = os.path.join(SPEC_FILE_DIR, sf_name)
-                        with open(spec_file_path, "wb") as f:
-                            f.write(uploaded_spek_file.getbuffer())
+                        spec_file_path = storage_upload(uploaded_spek_file, "spec_files", sf_name)
 
                     urun_foto_path = ""
                     if uploaded_urun_foto is not None:
                         uf_name = f"{secilen_cari}_{st_kod}_{int(datetime.now().timestamp())}_{uploaded_urun_foto.name}"
-                        urun_foto_path = os.path.join(SPEC_PHOTO_DIR, uf_name)
-                        with open(urun_foto_path, "wb") as f:
-                            f.write(uploaded_urun_foto.getbuffer())
+                        urun_foto_path = storage_upload(uploaded_urun_foto, "spec_photos", uf_name)
 
                     df_speks = load_data(SPEK_FILE, ["CariAdi", "StokKodu", "SpekAdi", "SpekDetayi", "SpekDosyaYolu", "UrunFotoYolu"])
                     new_spek = pd.DataFrame([{
@@ -720,28 +814,39 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                             st.markdown(f"**Spek Başlığı:** {row['SpekAdi']}")
                             st.markdown(f"**Detaylar:** {row['SpekDetayi']}")
                             
-                            if row['SpekDosyaYolu'] and os.path.exists(str(row['SpekDosyaYolu'])):
-                                with open(row['SpekDosyaYolu'], "rb") as file_btn:
+                            if row['SpekDosyaYolu']:
+                                spec_bytes = storage_download(row['SpekDosyaYolu'])
+                                if spec_bytes is not None:
                                     st.download_button(
                                         label="📥 Spek Belgesini İndir (PDF/Dosya)",
-                                        data=file_btn,
-                                        file_name=os.path.basename(row['SpekDosyaYolu']),
+                                        data=spec_bytes,
+                                        file_name=storage_filename(row['SpekDosyaYolu']),
                                         key=f"dl_spec_{idx}"
                                     )
+                                else:
+                                    st.warning("Spek dosyasına erişilemedi.")
                             else:
                                 st.info("Bu spek için dosya yüklenmemiş.")
                                 
                         with col_d2:
                             st.markdown("**Spek Belgesi Görseli / Önizleme**")
-                            if row['SpekDosyaYolu'] and os.path.exists(str(row['SpekDosyaYolu'])) and row['SpekDosyaYolu'].lower().endswith(('png', 'jpg', 'jpeg')):
-                                st.image(row['SpekDosyaYolu'], width=200)
+                            if row['SpekDosyaYolu'] and storage_is_image(row['SpekDosyaYolu']):
+                                preview_bytes = storage_download(row['SpekDosyaYolu'])
+                                if preview_bytes is not None:
+                                    st.image(preview_bytes, width=200)
+                                else:
+                                    st.write("Dosyaya erişilemedi.")
                             else:
                                 st.write("Doküman formatı veya dosya yok.")
 
                         with col_d3:
                             st.markdown("**Uygun Ürün Fotoğrafı**")
-                            if row['UrunFotoYolu'] and os.path.exists(str(row['UrunFotoYolu'])):
-                                st.image(row['UrunFotoYolu'], caption="Spek Uyumlu Ürün", width=200)
+                            if row['UrunFotoYolu']:
+                                urun_bytes = storage_download(row['UrunFotoYolu'])
+                                if urun_bytes is not None:
+                                    st.image(urun_bytes, caption="Spek Uyumlu Ürün", width=200)
+                                else:
+                                    st.info("Ürün fotoğrafına erişilemedi.")
                             else:
                                 st.info("Ürün fotoğrafı yüklenmemiş.")
 
@@ -1001,9 +1106,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                             photo_path = ""
                             if uploaded_photo is not None:
                                 photo_filename = f"{is_emri_no.strip()}_{int(datetime.now().timestamp())}.png"
-                                photo_path = os.path.join(PHOTO_DIR, photo_filename)
-                                with open(photo_path, "wb") as f:
-                                    f.write(uploaded_photo.getbuffer())
+                                photo_path = storage_upload(uploaded_photo, "production_photos", photo_filename)
 
                             meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar"])
                             meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != is_emri_no.strip()]
@@ -1061,9 +1164,10 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                     st.markdown(f"**Toplam Üretim Maliyeti:** {mamul_satir['ToplamTutar']:,.2f} TL (Birim: {mamul_satir['BirimFiyat']:,.2f} TL)")
                     st.markdown(f"**Mevcut Not:** {mevcut_not}")
                 with col_f2:
-                    if mevcut_foto and os.path.exists(mevcut_foto):
-                        img = Image.open(mevcut_foto)
-                        st.image(img, caption=f"İş Emri Fotoğrafı: {secilen_is_emri}", width=250)
+                    if mevcut_foto:
+                        foto_bytes = storage_download(mevcut_foto)
+                        if foto_bytes is not None:
+                            st.image(foto_bytes, caption=f"İş Emri Fotoğrafı: {secilen_is_emri}", width=250)
                     else:
                         st.info("Bu üretime ait fotoğraf yüklenmemiş.")
 
@@ -1296,9 +1400,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     final_photo_path = mevcut_foto
                                     if yeni_fotograf is not None:
                                         photo_filename = f"{secilen_is_emri}_{int(datetime.now().timestamp())}.png"
-                                        final_photo_path = os.path.join(PHOTO_DIR, photo_filename)
-                                        with open(final_photo_path, "wb") as f:
-                                            f.write(yeni_fotograf.getbuffer())
+                                        final_photo_path = storage_upload(yeni_fotograf, "production_photos", photo_filename)
 
                                     meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != str(secilen_is_emri)]
                                     new_meta = pd.DataFrame([{
@@ -1637,16 +1739,12 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                             s_foto_path = ""
                             if uploaded_shipment_photo is not None:
                                 sf_name = f"sevk_foto_{irsaliye_sevkiyat_no.strip()}_{int(datetime.now().timestamp())}.png"
-                                s_foto_path = os.path.join(SHIPMENT_PHOTO_DIR, sf_name)
-                                with open(s_foto_path, "wb") as f:
-                                    f.write(uploaded_shipment_photo.getbuffer())
+                                s_foto_path = storage_upload(uploaded_shipment_photo, "shipment_photos", sf_name)
 
                             s_doc_path = ""
                             if uploaded_ilce_tarim_doc is not None:
                                 sd_name = f"ilce_tarim_{irsaliye_sevkiyat_no.strip()}_{int(datetime.now().timestamp())}_{uploaded_ilce_tarim_doc.name}"
-                                s_doc_path = os.path.join(SHIPMENT_DOC_DIR, sd_name)
-                                with open(s_doc_path, "wb") as f:
-                                    f.write(uploaded_ilce_tarim_doc.getbuffer())
+                                s_doc_path = storage_upload(uploaded_ilce_tarim_doc, "shipment_docs", sd_name)
 
                             meta_ship_df = load_data(SHIPMENT_META_FILE, ["IrsaliyeNo", "MusteriAdi", "SevkFotoYolu", "IlceTarimDocYolu", "Notlar"])
                             meta_ship_df = meta_ship_df[meta_ship_df["IrsaliyeNo"].astype(str) != irsaliye_sevkiyat_no.strip()]
@@ -1795,28 +1893,39 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                         for _, ik in irs_kalemleri.iterrows():
                             st.write(f"- {ik['StokKodu']} {ik['StokAdi']} | Miktar: {ik['Miktar']:,.2f} {ik['Birim']} | Birim Fiyat: {ik['BirimFiyat']:,.2f} TL | Tutar: {ik['ToplamTutar']:,.2f} TL")
 
-                    if s_row['IlceTarimDocYolu'] and os.path.exists(str(s_row['IlceTarimDocYolu'])):
-                        with open(s_row['IlceTarimDocYolu'], "rb") as doc_btn:
+                    if s_row['IlceTarimDocYolu']:
+                        doc_bytes = storage_download(s_row['IlceTarimDocYolu'])
+                        if doc_bytes is not None:
                             st.download_button(
                                 label="📥 İlçe Tarım Evrakını İndir",
-                                data=doc_btn,
-                                file_name=os.path.basename(s_row['IlceTarimDocYolu']),
+                                data=doc_bytes,
+                                file_name=storage_filename(s_row['IlceTarimDocYolu']),
                                 key=f"dl_ilce_tarim_{idx}"
                             )
+                        else:
+                            st.warning("İlçe Tarım evrakına erişilemedi.")
                     else:
                         st.info("İlçe Tarım evrakı yüklenmemiş.")
 
                 with col_s2:
                     st.markdown("**Sevkiyat Fotoğrafı**")
-                    if s_row['SevkFotoYolu'] and os.path.exists(str(s_row['SevkFotoYolu'])):
-                        st.image(s_row['SevkFotoYolu'], width=200)
+                    if s_row['SevkFotoYolu']:
+                        sevk_bytes = storage_download(s_row['SevkFotoYolu'])
+                        if sevk_bytes is not None:
+                            st.image(sevk_bytes, width=200)
+                        else:
+                            st.write("Sevkiyat fotoğrafına erişilemedi.")
                     else:
                         st.write("Sevkiyat fotoğrafı yok.")
 
                 with col_s3:
                     st.markdown("**İlçe Tarım Belgesi Önizleme**")
-                    if s_row['IlceTarimDocYolu'] and os.path.exists(str(s_row['IlceTarimDocYolu'])) and s_row['IlceTarimDocYolu'].lower().endswith(('png', 'jpg', 'jpeg')):
-                        st.image(s_row['IlceTarimDocYolu'], width=200)
+                    if s_row['IlceTarimDocYolu'] and storage_is_image(s_row['IlceTarimDocYolu']):
+                        ilce_preview = storage_download(s_row['IlceTarimDocYolu'])
+                        if ilce_preview is not None:
+                            st.image(ilce_preview, width=200)
+                        else:
+                            st.write("Belgeye erişilemedi.")
                     else:
                         st.write("Önizleme yapılamıyor (PDF/Doküman).")
 
