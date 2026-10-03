@@ -16,6 +16,7 @@ import tempfile
 import threading
 import logging
 import json
+import unicodedata
 import requests
 from urllib.parse import quote
 import posixpath
@@ -63,8 +64,18 @@ def _storage_cfg():
         raise RuntimeError("Supabase Storage ayarları eksik. Streamlit Secrets içindeki [supabase] bölümünü kontrol edin.") from exc
 
 def _safe_storage_name(name):
+    """Supabase Storage için yalnızca güvenli ASCII dosya adı üretir."""
     name = os.path.basename(str(name or "dosya"))
-    return "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in name)
+    # Türkçe karakterleri önce açıkça sadeleştir, sonra kalan Unicode'u ASCII'ye indir.
+    name = name.translate(str.maketrans({
+        "ç": "c", "Ç": "C", "ğ": "g", "Ğ": "G",
+        "ı": "i", "İ": "I", "ö": "o", "Ö": "O",
+        "ş": "s", "Ş": "S", "ü": "u", "Ü": "U",
+    }))
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    name = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in name)
+    name = name.strip("._") or "dosya"
+    return name[:180]
 
 def storage_upload(uploaded_file, folder, filename=None):
     """Dosyayı private Supabase Storage bucket'a yükler ve object path döndürür."""
