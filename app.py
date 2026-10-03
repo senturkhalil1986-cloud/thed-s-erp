@@ -428,7 +428,7 @@ WATERMARK_LOGO_BASE64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAYGBgYHBgcICAcKCwoLCg8
 st.markdown(
     f"""
     <style>
-    [data-testid="stAppViewContainer"] {
+    [data-testid="stAppViewContainer"] {{
         background-color: #ffffff;
         background-image: linear-gradient(rgba(255,255,255,0.93), rgba(255,255,255,0.93)),
                           url("data:image/jpeg;base64,{WATERMARK_LOGO_BASE64}");
@@ -436,13 +436,13 @@ st.markdown(
         background-position: center 58%;
         background-size: min(48vw, 720px) auto;
         background-attachment: fixed;
-    }
-    [data-testid="stHeader"] {
+    }}
+    [data-testid="stHeader"] {{
         background: rgba(255,255,255,0.92);
-    }
-    [data-testid="stSidebar"] {
+    }}
+    [data-testid="stSidebar"] {{
         background-color: #f3f4f6;
-    }
+    }}
     </style>
     """,
     unsafe_allow_html=True,
