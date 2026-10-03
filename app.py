@@ -82,7 +82,11 @@ def storage_upload(uploaded_file, folder, filename=None):
     }
     resp = requests.post(endpoint, headers=headers, data=uploaded_file.getvalue(), timeout=60)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}).")
+        # Supabase hata gövdesini göster; service key hiçbir zaman mesaja eklenmez.
+        detail = (resp.text or "").strip()
+        if len(detail) > 800:
+            detail = detail[:800] + "..."
+        raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}): {detail}")
     return object_path
 
 def storage_download(object_path):
