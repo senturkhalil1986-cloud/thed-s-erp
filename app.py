@@ -44,15 +44,8 @@ def pg_conn():
             connect_timeout=15,
         )
     except Exception as exc:
-        # Geçici teşhis: gerçek PostgreSQL hatasını göster, ancak parolayı maskele.
-        try:
-            pwd = str(st.secrets.get("postgres", {}).get("password", ""))
-        except Exception:
-            pwd = ""
-        detail = str(exc).strip() or repr(exc)
-        if pwd:
-            detail = detail.replace(pwd, "***")
-        raise RuntimeError(f"PostgreSQL bağlantı teşhisi: {detail}") from exc
+        logging.exception("PostgreSQL bağlantısı kurulamadı")
+        raise RuntimeError("Veritabanı bağlantısı kurulamadı. Lütfen sistem yöneticisine başvurun.") from exc
 
 
 # --- SUPABASE STORAGE (özel bucket) ---
@@ -93,11 +86,9 @@ def storage_upload(uploaded_file, folder, filename=None):
     }
     resp = requests.post(endpoint, headers=headers, data=uploaded_file.getvalue(), timeout=60)
     if resp.status_code not in (200, 201):
-        # Supabase hata gövdesini göster; service key hiçbir zaman mesaja eklenmez.
         detail = (resp.text or "").strip()
-        if len(detail) > 800:
-            detail = detail[:800] + "..."
-        raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}): {detail}")
+        logging.error("Storage upload başarısız status=%s detail=%s", resp.status_code, detail[:800])
+        raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}). Lütfen sistem yöneticisine başvurun.")
     return object_path
 
 def storage_download(object_path):
@@ -411,47 +402,6 @@ if st.session_state.get("role") == "admin":
                 st.error("Bu kullanıcı adı zaten kayıtlı.")
             except Exception as exc:
                 st.error(str(exc))
-    with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
-        st.caption("Sunucudaki yalnızca geçici log/cache dosyalarını gösterir. Ana ERP kayıtları PostgreSQL, belge ve fotoğraflar Supabase Storage içindedir.")
-        import zipfile
-        import glob
-
-        recovery_files = []
-        if os.path.isdir(DB_DIR):
-            for root, dirs, files in os.walk(DB_DIR):
-                for name in files:
-                    full_path = os.path.join(root, name)
-                    try:
-                        size = os.path.getsize(full_path)
-                    except OSError:
-                        size = -1
-                    recovery_files.append((full_path, size))
-
-        if recovery_files:
-            st.success(f"data klasöründe {len(recovery_files)} dosya bulundu.")
-            recovery_df = pd.DataFrame(
-                [{"Dosya": os.path.relpath(path, DB_DIR), "Boyut (byte)": size} for path, size in recovery_files]
-            )
-            st.dataframe(recovery_df, use_container_width=True, hide_index=True)
-
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for full_path, _ in recovery_files:
-                    try:
-                        zf.write(full_path, arcname=os.path.relpath(full_path, DB_DIR))
-                    except OSError:
-                        pass
-            zip_buffer.seek(0)
-            st.download_button(
-                "⬇️ DATA KLASÖRÜNÜ ZIP OLARAK İNDİR",
-                data=zip_buffer.getvalue(),
-                file_name=f"erp_data_recovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-        else:
-            st.error("data klasörü bulunamadı.")
-
     with st.sidebar.expander("🛡️ Veri Güvenliği"):
         st.success("Toplu veri silme kapatıldı. ERP kayıtları Supabase PostgreSQL'de, dosyalar private Supabase Storage'da tutulur.")
         st.caption("Kritik silme işlemleri yalnızca ilgili kayıt ekranlarından kontrollü olarak yapılabilir.")
