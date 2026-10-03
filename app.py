@@ -43,7 +43,15 @@ def pg_conn():
             connect_timeout=15,
         )
     except Exception as exc:
-        raise RuntimeError("Supabase/PostgreSQL bağlantısı kurulamadı. Streamlit Secrets ayarlarını kontrol edin.") from exc
+        # Geçici teşhis: gerçek PostgreSQL hatasını göster, ancak parolayı maskele.
+        try:
+            pwd = str(st.secrets.get("postgres", {}).get("password", ""))
+        except Exception:
+            pwd = ""
+        detail = str(exc).strip() or repr(exc)
+        if pwd:
+            detail = detail.replace(pwd, "***")
+        raise RuntimeError(f"PostgreSQL bağlantı teşhisi: {detail}") from exc
 
 
 # --- SUPABASE STORAGE (özel bucket) ---
