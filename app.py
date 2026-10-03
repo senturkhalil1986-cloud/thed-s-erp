@@ -91,6 +91,39 @@ def storage_upload(uploaded_file, folder, filename=None):
         raise RuntimeError(f"Dosya Storage'a yüklenemedi ({resp.status_code}). Lütfen sistem yöneticisine başvurun.")
     return object_path
 
+def storage_delete(object_path):
+    """Private Supabase Storage nesnesini siler. Boş yol için başarılı kabul edilir."""
+    if not object_path:
+        return True
+    object_path = str(object_path).strip()
+    if not object_path:
+        return True
+
+    # Eski yerel dosya kaydı varsa onu da temizleyebil.
+    if os.path.exists(object_path):
+        try:
+            os.remove(object_path)
+            return True
+        except Exception as exc:
+            logging.error("Yerel dosya silinemedi path=%s error=%s", object_path, exc)
+            return False
+
+    try:
+        base_url, key, bucket = _storage_cfg()
+        endpoint = f"{base_url}/storage/v1/object/{quote(bucket, safe='')}/{quote(object_path, safe='/')}"
+        headers = {"Authorization": f"Bearer {key}", "apikey": key}
+        resp = requests.delete(endpoint, headers=headers, timeout=60)
+        if resp.status_code in (200, 204):
+            return True
+        # Nesne zaten yoksa temizlik tamamlanmış sayılır.
+        if resp.status_code == 404:
+            return True
+        logging.error("Storage delete başarısız status=%s path=%s detail=%s", resp.status_code, object_path, (resp.text or "")[:800])
+        return False
+    except Exception as exc:
+        logging.error("Storage delete exception path=%s error=%s", object_path, exc)
+        return False
+
 def storage_download(object_path):
     """Private Storage nesnesini byte olarak indirir."""
     if not object_path:
@@ -692,10 +725,18 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
             sil_cari_sec = st.selectbox("Silmek İstediğin Cariyi Seç", ["Seçiniz..."] + df_cariler["CariAdi"].tolist(), key="del_cari_sel")
             if st.button("Seçilen Cariyi Sil"):
                 if sil_cari_sec != "Seçiniz...":
-                    df_cariler = df_cariler[df_cariler["CariAdi"] != sil_cari_sec]
-                    save_data(df_cariler, CARILER_FILE)
-                    st.success(f"'{sil_cari_sec}' cari kaydı silindi!")
-                    st.rerun()
+                    # Bağlı spek/dosya varken cariyi tek başına silmeye izin verme.
+                    cari_speks = load_data(SPEK_FILE, ["CariAdi", "StokKodu", "SpekAdi", "SpekDetayi", "SpekDosyaYolu", "UrunFotoYolu"])
+                    bagli_spek = cari_speks[cari_speks["CariAdi"].astype(str) == str(sil_cari_sec)] if not cari_speks.empty else pd.DataFrame()
+                    if not bagli_spek.empty:
+                        st.error("Bu cariye bağlı ürün spekleri/dosyaları var. Önce Cari Ürün & Spek Tanımları sekmesinden bağlı spekleri silin.")
+                    else:
+                        silinen_cari = df_cariler[df_cariler["CariAdi"] == sil_cari_sec].copy()
+                        df_cariler = df_cariler[df_cariler["CariAdi"] != sil_cari_sec]
+                        save_data(df_cariler, CARILER_FILE)
+                        audit_log("SILME", "CARI", str(sil_cari_sec), old_value=silinen_cari)
+                        st.success(f"'{sil_cari_sec}' cari kaydı silindi!")
+                        st.rerun()
 
     with tab2:
         st.subheader("Cari Bazlı Ürün Spekleri, Dokümanları and Ürün Fotoğrafları Tanımla")
@@ -772,10 +813,26 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                         s_kod = secilen_spek_sil.split("Ürün: ")[1].split(" | ")[0].strip()
                         s_baslik = secilen_spek_sil.split("Spek: ")[1].strip()
                         
-                        df_speks = df_speks[~((df_speks["CariAdi"] == f_adi) & (df_speks["StokKodu"] == s_kod) & (df_speks["SpekAdi"] == s_baslik))]
-                        save_data(df_speks, SPEK_FILE)
-                        st.success("Seçilen spek kaydı silindi!")
-                        st.rerun()
+                        spek_mask = ((df_speks["CariAdi"] == f_adi) & (df_speks["StokKodu"] == s_kod) & (df_speks["SpekAdi"] == s_baslik))
+                        silinen_spek = df_speks[spek_mask].copy()
+
+                        # Önce bağlı Storage nesnelerini temizle. Bir dosya silinemezse
+                        # DB kaydını koruyarak yetim dosya oluşmasını engelle.
+                        storage_ok = True
+                        for _, sil_row in silinen_spek.iterrows():
+                            for path_col in ("SpekDosyaYolu", "UrunFotoYolu"):
+                                obj_path = str(sil_row.get(path_col, "") or "").strip()
+                                if obj_path and not storage_delete(obj_path):
+                                    storage_ok = False
+
+                        if not storage_ok:
+                            st.error("Speke bağlı dosyalardan biri Storage'dan silinemedi. Kayıt güvenlik için silinmedi.")
+                        else:
+                            df_speks = df_speks[~spek_mask]
+                            save_data(df_speks, SPEK_FILE)
+                            audit_log("SILME", "SPEK", f"{f_adi}|{s_kod}|{s_baslik}", old_value=silinen_spek)
+                            st.success("Seçilen spek kaydı ve bağlı dosyaları silindi!")
+                            st.rerun()
 
                 st.markdown("---")
                 for idx, row in df_speks.iterrows():
@@ -1251,11 +1308,23 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                             mask_mamul = (tx_df["PartiNo"].astype(str) == str(secilen_is_emri)) & (tx_df["Tedarikci"] == "Dahili Üretim")
                             mask_sarf_fire = tx_df["Tedarikci"].astype(str).str.contains(str(secilen_is_emri), regex=False) | (tx_df["PartiNo"].astype(str) == f"{secilen_is_emri}-FIRE")
                             silinen_uretim = tx_df[mask_mamul | mask_sarf_fire].copy()
-                            tx_df = tx_df[~(mask_mamul | mask_sarf_fire)]
-                            save_data(tx_df, STOCK_TRANSACTIONS_FILE)
-                            audit_log("SILME", "URETIM", secilen_is_emri, old_value=silinen_uretim)
-                            st.success(f"✅ '{secilen_is_emri}' nolu iş emri silindi and tüm hareketler iptal edildi!")
-                            st.rerun()
+                            silinen_meta = meta_df[meta_df["IsEmriNo"].astype(str) == str(secilen_is_emri)].copy()
+                            foto_paths = [str(x or "").strip() for x in silinen_meta.get("FotografYolu", pd.Series(dtype=str)).tolist()]
+                            storage_ok = all(storage_delete(x) for x in foto_paths if x)
+
+                            if not storage_ok:
+                                st.error("Üretime bağlı fotoğraf Storage'dan silinemedi. Üretim kaydı güvenlik için silinmedi.")
+                            else:
+                                tx_df = tx_df[~(mask_mamul | mask_sarf_fire)]
+                                save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                                meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != str(secilen_is_emri)]
+                                save_data(meta_df, PRODUCTION_META_FILE)
+                                audit_log("SILME", "URETIM", secilen_is_emri, old_value={
+                                    "hareketler": silinen_uretim.to_dict(orient="records"),
+                                    "meta": silinen_meta.to_dict(orient="records")
+                                })
+                                st.success(f"✅ '{secilen_is_emri}' nolu iş emri, meta kaydı ve bağlı fotoğrafı silindi!")
+                                st.rerun()
 
                         if guncelle_pressed:
                             secilen_yeni_recete = [(m, a) for m, a in edit_sarf_secimleri if m != "Seçiniz..." and a > 0]
@@ -1371,9 +1440,12 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     save_data(tx_df, STOCK_TRANSACTIONS_FILE)
 
                                     final_photo_path = mevcut_foto
+                                    eski_foto_silinecek = ""
                                     if yeni_fotograf is not None:
                                         photo_filename = f"{secilen_is_emri}_{int(datetime.now().timestamp())}.png"
                                         final_photo_path = storage_upload(yeni_fotograf, "production_photos", photo_filename)
+                                        if mevcut_foto and mevcut_foto != final_photo_path:
+                                            eski_foto_silinecek = mevcut_foto
 
                                     meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != str(secilen_is_emri)]
                                     new_meta = pd.DataFrame([{
@@ -1385,6 +1457,8 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     }])
                                     meta_df = pd.concat([meta_df, new_meta], ignore_index=True)
                                     save_data(meta_df, PRODUCTION_META_FILE)
+                                    if eski_foto_silinecek and not storage_delete(eski_foto_silinecek):
+                                        st.warning("Yeni fotoğraf kaydedildi; eski fotoğraf Storage'dan otomatik temizlenemedi.")
                                     audit_log("GUNCELLEME", "URETIM", secilen_is_emri, old_value=eski_uretim_snapshot, new_value={
                                         "hareketler": yeni_eklenen_hareketler,
                                         "meta": new_meta.to_dict(orient="records")
@@ -1909,6 +1983,18 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                     sevk_mask = (tx_df["HareketTuru"] == "Çıkış") & (tx_df["Aciklama"].astype(str).str.contains(irs_no, regex=False))
                     silinen_sevk_hareketleri = tx_df[sevk_mask].copy()
                     silinen_sevk_meta = meta_ship_df[meta_ship_df["IrsaliyeNo"].astype(str) == irs_no].copy()
+                    ship_file_paths = []
+                    for _, ship_row in silinen_sevk_meta.iterrows():
+                        for path_col in ("SevkFotoYolu", "IlceTarimDocYolu"):
+                            pth = str(ship_row.get(path_col, "") or "").strip()
+                            if pth:
+                                ship_file_paths.append(pth)
+                    storage_ok = all(storage_delete(pth) for pth in ship_file_paths)
+
+                    if not storage_ok:
+                        st.error("Sevkiyata bağlı fotoğraf/belgelerden biri Storage'dan silinemedi. Sevkiyat kaydı güvenlik için silinmedi.")
+                        st.stop()
+
                     tx_df = tx_df[~sevk_mask]
                     save_data(tx_df, STOCK_TRANSACTIONS_FILE)
                     
