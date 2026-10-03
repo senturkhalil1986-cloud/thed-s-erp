@@ -285,6 +285,47 @@ if st.session_state.get("role") == "admin":
                 st.error("Bu kullanıcı adı zaten kayıtlı.")
             except Exception as exc:
                 st.error(str(exc))
+    with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
+        st.caption("Sunucudaki data klasörünü kontrol eder ve varsa tek ZIP olarak indirir.")
+        import zipfile
+        import glob
+
+        recovery_files = []
+        if os.path.isdir(DB_DIR):
+            for root, dirs, files in os.walk(DB_DIR):
+                for name in files:
+                    full_path = os.path.join(root, name)
+                    try:
+                        size = os.path.getsize(full_path)
+                    except OSError:
+                        size = -1
+                    recovery_files.append((full_path, size))
+
+        if recovery_files:
+            st.success(f"data klasöründe {len(recovery_files)} dosya bulundu.")
+            recovery_df = pd.DataFrame(
+                [{"Dosya": os.path.relpath(path, DB_DIR), "Boyut (byte)": size} for path, size in recovery_files]
+            )
+            st.dataframe(recovery_df, use_container_width=True, hide_index=True)
+
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for full_path, _ in recovery_files:
+                    try:
+                        zf.write(full_path, arcname=os.path.relpath(full_path, DB_DIR))
+                    except OSError:
+                        pass
+            zip_buffer.seek(0)
+            st.download_button(
+                "⬇️ DATA KLASÖRÜNÜ ZIP OLARAK İNDİR",
+                data=zip_buffer.getvalue(),
+                file_name=f"erp_data_recovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        else:
+            st.error("data klasörü bulunamadı.")
+
     with st.sidebar.expander("⚠️ Tehlikeli işlemler"):
         confirm_reset = st.checkbox("Tüm CSV verilerini silmeyi onaylıyorum")
         if st.button("Tüm Verileri Sıfırla", disabled=not confirm_reset):
