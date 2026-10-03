@@ -21,6 +21,7 @@ import requests
 from urllib.parse import quote
 import posixpath
 from pathlib import Path
+import zipfile
 
 st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
 
@@ -141,6 +142,76 @@ def storage_download(object_path):
     if resp.status_code == 200:
         return resp.content
     return None
+
+def storage_list_all():
+    """Private bucket içindeki tüm nesne yollarını döndürür."""
+    base_url, key, bucket = _storage_cfg()
+    endpoint = f"{base_url}/storage/v1/object/list/{quote(bucket, safe='')}"
+    headers = {"Authorization": f"Bearer {key}", "apikey": key, "Content-Type": "application/json"}
+    found = []
+
+    def walk(prefix=""):
+        offset = 0
+        while True:
+            payload = {"prefix": prefix, "limit": 1000, "offset": offset, "sortBy": {"column": "name", "order": "asc"}}
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Storage listesi alınamadı ({resp.status_code}).")
+            items = resp.json() or []
+            for item in items:
+                name = str(item.get("name", ""))
+                if not name:
+                    continue
+                full = f"{prefix}/{name}" if prefix else name
+                if item.get("id") is None:
+                    walk(full)
+                else:
+                    found.append(full)
+            if len(items) < 1000:
+                break
+            offset += 1000
+
+    walk("")
+    return found
+
+
+def build_full_backup_zip():
+    """PostgreSQL tabloları + private Storage dosyalarını tek ZIP halinde üretir."""
+    tables = [
+        "master_items", "stock_transactions", "production_meta", "shipment_meta",
+        "cariler", "cari_urun_spekleri", "erp_users", "audit_log"
+    ]
+    out = BytesIO()
+    manifest = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "database": "Supabase PostgreSQL",
+        "storage_bucket": _storage_cfg()[2],
+        "tables": {},
+        "storage_files": [],
+    }
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        with pg_conn() as conn:
+            for table in tables:
+                df = pd.read_sql_query(sql.SQL("SELECT * FROM public.{} ORDER BY created_at NULLS LAST").format(sql.Identifier(table)).as_string(conn), conn)
+                manifest["tables"][table] = int(len(df))
+                zf.writestr(f"database/{table}.csv", df.to_csv(index=False).encode("utf-8-sig"))
+
+        for object_path in storage_list_all():
+            blob = storage_download(object_path)
+            if blob is None:
+                raise RuntimeError(f"Storage dosyası yedeğe alınamadı: {object_path}")
+            zf.writestr(f"storage/{object_path}", blob)
+            manifest["storage_files"].append(object_path)
+
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+        zf.writestr("README.txt", (
+            "THE DIŞ TİCARET ERP TAM YEDEK\n"
+            "Bu ZIP PostgreSQL tablo dışa aktarımlarını ve Supabase Storage dosyalarını içerir.\n"
+            "erp_users.csv parola hash/salt bilgileri içerdiği için bu yedeği gizli ve güvenli saklayın.\n"
+        ).encode("utf-8"))
+    out.seek(0)
+    return out.getvalue(), manifest
+
 
 def storage_filename(object_path):
     return posixpath.basename(str(object_path or "dosya"))
@@ -435,6 +506,32 @@ if st.session_state.get("role") == "admin":
                 st.error("Bu kullanıcı adı zaten kayıtlı.")
             except Exception as exc:
                 st.error(str(exc))
+    with st.sidebar.expander("💾 Yerel Tam Yedek"):
+        st.caption("PostgreSQL kayıtları ve Supabase Storage dosyalarını tek ZIP olarak bilgisayarına indirir.")
+        if st.button("Yedeği Hazırla", key="prepare_full_backup", use_container_width=True):
+            try:
+                with st.spinner("Tam yedek hazırlanıyor..."):
+                    backup_bytes, backup_manifest = build_full_backup_zip()
+                st.session_state["full_backup_bytes"] = backup_bytes
+                st.session_state["full_backup_name"] = f"THE_DIS_TICARET_TAM_YEDEK_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.zip"
+                st.session_state["full_backup_manifest"] = backup_manifest
+                audit_log("YEDEK", "SISTEM", "TAM_YEDEK", new_value={"tablolar": backup_manifest["tables"], "dosya_adedi": len(backup_manifest["storage_files"])})
+                st.success("Yedek hazır. Aşağıdaki butondan bilgisayarına indir.")
+            except Exception as exc:
+                logging.exception("FULL_BACKUP_ERROR")
+                st.error(f"Yedek hazırlanamadı: {exc}")
+        if st.session_state.get("full_backup_bytes"):
+            st.download_button(
+                "⬇️ Tam Yedeği İndir",
+                data=st.session_state["full_backup_bytes"],
+                file_name=st.session_state.get("full_backup_name", "THE_DIS_TICARET_TAM_YEDEK.zip"),
+                mime="application/zip",
+                use_container_width=True,
+            )
+            mf = st.session_state.get("full_backup_manifest", {})
+            st.caption(f"Tablo: {len(mf.get('tables', {}))} • Storage dosyası: {len(mf.get('storage_files', []))}")
+        st.warning("Yedek kullanıcı parola hash/salt kayıtlarını da içerir. ZIP dosyasını güvenli yerde sakla.")
+
     with st.sidebar.expander("🛡️ Veri Güvenliği"):
         st.success("Toplu veri silme kapatıldı. ERP kayıtları Supabase PostgreSQL'de, dosyalar private Supabase Storage'da tutulur.")
         st.caption("Kritik silme işlemleri yalnızca ilgili kayıt ekranlarından kontrollü olarak yapılabilir.")
