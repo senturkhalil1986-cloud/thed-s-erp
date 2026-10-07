@@ -200,6 +200,18 @@ def load_data(filepath, columns):
                 cur.execute(query)
                 rows = cur.fetchall()
         df = pd.DataFrame(rows, columns=columns)
+
+        # PostgreSQL NUMERIC alanlari psycopg2 tarafindan Decimal olarak gelebilir.
+        # ERP hesaplarinda Decimal/float karisikligi TypeError olusturmasin diye
+        # tum bilinen sayisal kolonlari veri kaynaginda tek tip float'a ceviriyoruz.
+        numeric_columns = {
+            "Miktar", "BirimFiyat", "ToplamTutar", "KalanMiktar",
+            "UretimMiktari", "FireMiktari", "SatisFiyati", "ToplamSatis",
+            "Maliyet", "BirimMaliyet", "ToplamMaliyet"
+        }
+        for col in numeric_columns.intersection(df.columns):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
+
         if "StokKodu" in df.columns and not df.empty:
             df = df.dropna(subset=["StokKodu"])
             df = df[df["StokKodu"].astype(str).str.strip() != ""]
