@@ -16,6 +16,9 @@ import tempfile
 import threading
 import logging
 import json
+import urllib.request
+import urllib.parse
+import mimetypes
 
 st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
 
@@ -245,8 +248,26 @@ def load_data(filepath, columns):
         logging.exception("DB_READ_ERROR table=%s", table)
         raise RuntimeError(f"Supabase verisi okunamadı: {table}") from exc
 
+def _storage_config():
+    """Mevcut [supabase] secret'ını kullanarak özel mal-kabul bucket'ına bağlanır."""
+    try:
+        cfg = st.secrets["supabase"]
+        url = str(cfg["url"]).rstrip("/")
+        # Projede zaten kullanılan sunucu anahtarı. Yeni secret gerektirmez.
+        key = str(cfg["service_key"])
+        # Mevcut cfg["bucket"] = erp-files başka modüller için aynen kalır.
+        # Mal kabul belgeleri daima kendi private bucket'ına gider.
+        bucket = "mal-kabul-belgeleri"
+        return url, key, bucket
+    except Exception as exc:
+        raise RuntimeError(
+            "Supabase Storage ayarı eksik. Mevcut Streamlit Secrets içindeki "
+            "[supabase] url ve service_key bilgilerini kontrol edin."
+        ) from exc
+
+
 def ensure_warehouse_receipt_files_table():
-    """Depo kabul görsellerini Supabase PostgreSQL içinde kalıcı olarak saklayan tabloyu hazırlar."""
+    """Mal kabul eklerinin yalnızca Storage yolunu ve metadatasını SQL'de tutar."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -257,15 +278,49 @@ def ensure_warehouse_receipt_files_table():
                     file_type TEXT NOT NULL CHECK (file_type IN ('urun', 'irsaliye')),
                     file_name TEXT NOT NULL,
                     mime_type TEXT,
-                    file_data BYTEA NOT NULL,
+                    file_data BYTEA,
+                    storage_path TEXT,
                     uploaded_by TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
             )
+            cur.execute("ALTER TABLE public.warehouse_receipt_files ADD COLUMN IF NOT EXISTS storage_path TEXT")
+            cur.execute("ALTER TABLE public.warehouse_receipt_files ALTER COLUMN file_data DROP NOT NULL")
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_warehouse_receipt_files_parti_no ON public.warehouse_receipt_files(parti_no)"
             )
+
+
+def _storage_request(method, storage_path, data=None, content_type=None):
+    base_url, key, bucket = _storage_config()
+    encoded_path = urllib.parse.quote(str(storage_path).lstrip('/'), safe='/')
+    endpoint = f"{base_url}/storage/v1/object/{bucket}/{encoded_path}"
+    headers = {"Authorization": f"Bearer {key}", "apikey": key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if method == "POST":
+        headers["x-upsert"] = "false"
+    req = urllib.request.Request(endpoint, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read()
+    except Exception as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"Supabase Storage işlemi başarısız: {detail or exc}") from exc
+
+
+def _safe_storage_name(name):
+    raw = os.path.basename(str(name or "dosya"))
+    stem, ext = os.path.splitext(raw)
+    safe_stem = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in stem).strip('_') or 'dosya'
+    safe_ext = ''.join(c for c in ext.lower() if c.isalnum() or c == '.')
+    return f"{safe_stem[:80]}{safe_ext[:12]}"
+
 
 def save_warehouse_receipt_file(parti_no, file_type, uploaded_file):
     if uploaded_file is None:
@@ -274,39 +329,70 @@ def save_warehouse_receipt_file(parti_no, file_type, uploaded_file):
     file_bytes = uploaded_file.getvalue()
     if len(file_bytes) > 10 * 1024 * 1024:
         raise ValueError(f"{uploaded_file.name} dosyası 10 MB sınırını aşıyor.")
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.warehouse_receipt_files
-                    (parti_no, file_type, file_name, mime_type, file_data, uploaded_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (str(parti_no).strip(), file_type, uploaded_file.name,
-                 uploaded_file.type or "application/octet-stream", psycopg2.Binary(file_bytes),
-                 st.session_state.get("username", "system"))
-            )
+    safe_name = _safe_storage_name(uploaded_file.name)
+    unique = secrets.token_hex(6)
+    storage_path = f"{str(parti_no).strip()}/{file_type}_{unique}_{safe_name}"
+    mime_type = uploaded_file.type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    _storage_request("POST", storage_path, data=file_bytes, content_type=mime_type)
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.warehouse_receipt_files
+                        (parti_no, file_type, file_name, mime_type, storage_path, uploaded_by)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (str(parti_no).strip(), file_type, uploaded_file.name, mime_type, storage_path,
+                     st.session_state.get("username", "system"))
+                )
+    except Exception:
+        try:
+            _storage_request("DELETE", storage_path)
+        except Exception:
+            logging.exception("ORPHAN_STORAGE_FILE path=%s", storage_path)
+        raise
+
 
 def delete_warehouse_receipt_files(parti_no):
     try:
         ensure_warehouse_receipt_files_table()
         with pg_conn() as conn:
             with conn.cursor() as cur:
+                cur.execute('SELECT storage_path FROM public.warehouse_receipt_files WHERE parti_no=%s', (str(parti_no).strip(),))
+                paths = [r[0] for r in cur.fetchall() if r[0]]
+        for path in paths:
+            try:
+                _storage_request("DELETE", path)
+            except Exception:
+                logging.exception("WAREHOUSE_STORAGE_DELETE_ERROR path=%s", path)
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
                 cur.execute('DELETE FROM public.warehouse_receipt_files WHERE parti_no=%s', (str(parti_no).strip(),))
     except Exception:
         logging.exception("WAREHOUSE_FILE_DELETE_ERROR parti=%s", parti_no)
+
 
 def load_warehouse_receipt_files(parti_no):
     ensure_warehouse_receipt_files_table()
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id, file_type, file_name, mime_type, file_data, created_at
+                """SELECT id, file_type, file_name, mime_type, storage_path, file_data, created_at
                    FROM public.warehouse_receipt_files
                    WHERE parti_no=%s ORDER BY id""",
                 (str(parti_no).strip(),)
             )
             return cur.fetchall()
+
+
+def read_warehouse_receipt_file(storage_path, legacy_file_data=None):
+    """Yeni kayıtları Storage'dan; eski kayıtları varsa SQL BYTEA alanından okur."""
+    if storage_path:
+        return _storage_request("GET", storage_path)
+    if legacy_file_data is not None:
+        return bytes(legacy_file_data)
+    return b""
 
 def generate_auto_parti_no(giris_tarihi):
     """Depo girişleri için G-YYMMDD-001 biçiminde sıradaki benzersiz parti numarasını üretir."""
@@ -820,8 +906,8 @@ elif choice == "2. Depo / Malzeme Girişi":
                     arsiv_files = load_warehouse_receipt_files(arsiv_parti)
                     if not arsiv_files:
                         st.info("Bu lot için kayıtlı görsel veya belge bulunmuyor. Eski depo girişlerinde ek olmayabilir.")
-                    for file_id, file_type, file_name, mime_type, file_data, created_at in arsiv_files:
-                        data = bytes(file_data)
+                    for file_id, file_type, file_name, mime_type, storage_path, legacy_file_data, created_at in arsiv_files:
+                        data = read_warehouse_receipt_file(storage_path, legacy_file_data)
                         baslik = "📷 Ürün Görseli" if file_type == "urun" else "📄 İrsaliye"
                         st.markdown(f"**{baslik}: {file_name}**")
                         if (mime_type or "").startswith("image/"):
