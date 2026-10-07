@@ -1408,9 +1408,9 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
             .sum()
             .reset_index()
         )
-        global_summary_df["Toplam Giriş"] = pd.to_numeric(global_summary_df["Toplam Giriş"], errors="coerce").fillna(0)
-global_summary_df["Toplam Çıkış"] = pd.to_numeric(global_summary_df["Toplam Çıkış"], errors="coerce").fillna(0)
-global_summary_df["Net Kalan"] = global_summary_df["Toplam Giriş"] - global_summary_df["Toplam Çıkış"]
+        global_summary_df["Toplam Giriş"] = pd.to_numeric(global_summary_df["Toplam Giriş"], errors="coerce").fillna(0.0)
+        global_summary_df["Toplam Çıkış"] = pd.to_numeric(global_summary_df["Toplam Çıkış"], errors="coerce").fillna(0.0)
+        global_summary_df["Net Kalan"] = global_summary_df["Toplam Giriş"] - global_summary_df["Toplam Çıkış"]
         global_summary_df.columns = ["Stok Kodu", "Stok Adı", "Depo", "Birim", "Toplam Giriş", "Toplam Çıkış", "Net Kalan"]
         
         if secilen_depo_filtre != "Tümü":
