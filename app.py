@@ -304,13 +304,15 @@ ROLE_LABELS = {
 ROLE_MODULES = {
     "admin": ALL_MENU,
     "yonetici": ALL_MENU,
-    "depo": [ALL_MENU[1], ALL_MENU[2], ALL_MENU[7]],
+    "depo": [ALL_MENU[2], ALL_MENU[4], ALL_MENU[5], ALL_MENU[7]],
     "uretim": [ALL_MENU[4], ALL_MENU[5], ALL_MENU[7]],
     "satis": [ALL_MENU[6], ALL_MENU[7]],
     # Eski kullanıcıların erişimini bir anda bozmamak için geriye dönük uyumluluk.
     "personel": ALL_MENU[1:],
 }
 current_role = st.session_state.get("role", "personel")
+# Finansal bilgiler yalnızca yönetici ve admin rollerinde görünür.
+can_view_financial = current_role in ("admin", "yonetici")
 menu = ROLE_MODULES.get(current_role, ALL_MENU[1:])
 if not menu:
     st.error("Bu kullanıcıya atanmış aktif bir modül yetkisi bulunmuyor.")
@@ -834,7 +836,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                     "PartiNo": p_no,
                     "BirimFiyat": g_row["BirimFiyat"],
                     "KalanMiktar": kalan_mik,
-                    "Etiket": f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {g_row['BirimFiyat']:,.2f} TL | Kalan: {kalan_mik:,.2f} {g_row['Birim']}"
+                    "Etiket": (f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {g_row['BirimFiyat']:,.2f} TL | Kalan: {kalan_mik:,.2f} {g_row['Birim']}" if can_view_financial else f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Kalan: {kalan_mik:,.2f} {g_row['Birim']}")
                 })
         
         df_aktif_partiler = pd.DataFrame(parti_stoklari)
@@ -907,35 +909,50 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                     with fc2:
                         f_amt = st.number_input(f"Fire Miktar {j+1}", min_value=0.0, step=1.0, format="%.2f", key=f"fire_amt_{j}")
                     with fc3:
-                        f_fiyat = st.number_input(f"Birim Değer {j+1} (TL)", min_value=0.0, step=0.01, format="%.2f", key=f"fire_price_{j}")
+                        if can_view_financial:
+                            f_fiyat = st.number_input(f"Birim Değer {j+1} (TL)", min_value=0.0, step=0.01, format="%.2f", key=f"fire_price_{j}")
+                        else:
+                            f_fiyat = 0.0
+                            st.caption("Değer bilgisi yönetici yetkisindedir.")
                     fire_secimleri.append((f_sec, f_amt, f_fiyat))
 
                 st.markdown("---")
-                st.subheader("4️⃣ İşçilik and Ek Üretim Giderleri")
-                
-                ec1, ec2, ec3, ec4 = st.columns(4)
-                with ec1:
-                    is_emri_no = st.text_input("İş Emri / Parti No *Zorunlu and Benzersiz Olmalı*", placeholder="Örn: URT-2026-001")
-                with ec2:
-                    gunluk_isci_maliyeti = st.number_input("İşçi Günlük Maliyet (TL)", min_value=0.0, step=50.0, value=2500.0, format="%.2f")
-                with ec3:
-                    isci_sayisi = st.number_input("İşçi Sayısı", min_value=1, step=1, value=10)
-                with ec4:
-                    calisma_suresi_saat = st.number_input("Çalışma Süresi (Saat)", min_value=0.0, step=0.5, value=8.0)
+                st.subheader("4️⃣ İş Emri ve Çalışma Bilgileri")
 
-                saatlik_tekil_maliyet = gunluk_isci_maliyeti / 8.0 if gunluk_isci_maliyeti > 0 else 0.0
-                hesaplanan_iscilik_maliyeti = saatlik_tekil_maliyet * calisma_suresi_saat * isci_sayisi
-
-                ec5, ec6 = st.columns(2)
-                with ec5:
-                    ek_giderler = st.number_input("Ek Enerji / Diğer Giderler (TL)", min_value=0.0, step=50.0, value=0.0, format="%.2f")
-                with ec6:
-                    toplam_iscilik_gideri = hesaplanan_iscilik_maliyeti + ek_giderler
-                    st.markdown(f"**💰 Toplam Personel and Ek Gider:** `{toplam_iscilik_gideri:,.2f} TL`")
+                if can_view_financial:
+                    ec1, ec2, ec3, ec4 = st.columns(4)
+                    with ec1:
+                        is_emri_no = st.text_input("İş Emri / Parti No *Zorunlu and Benzersiz Olmalı*", placeholder="Örn: URT-2026-001")
+                    with ec2:
+                        gunluk_isci_maliyeti = st.number_input("İşçi Günlük Maliyet (TL)", min_value=0.0, step=50.0, value=2500.0, format="%.2f")
+                    with ec3:
+                        isci_sayisi = st.number_input("İşçi Sayısı", min_value=1, step=1, value=10)
+                    with ec4:
+                        calisma_suresi_saat = st.number_input("Çalışma Süresi (Saat)", min_value=0.0, step=0.5, value=8.0)
+                    saatlik_tekil_maliyet = gunluk_isci_maliyeti / 8.0 if gunluk_isci_maliyeti > 0 else 0.0
+                    hesaplanan_iscilik_maliyeti = saatlik_tekil_maliyet * calisma_suresi_saat * isci_sayisi
+                    ec5, ec6 = st.columns(2)
+                    with ec5:
+                        ek_giderler = st.number_input("Ek Enerji / Diğer Giderler (TL)", min_value=0.0, step=50.0, value=0.0, format="%.2f")
+                    with ec6:
+                        toplam_iscilik_gideri = hesaplanan_iscilik_maliyeti + ek_giderler
+                        st.markdown(f"**💰 Toplam Personel and Ek Gider:** `{toplam_iscilik_gideri:,.2f} TL`")
+                else:
+                    ec1, ec2, ec3 = st.columns(3)
+                    with ec1:
+                        is_emri_no = st.text_input("İş Emri / Parti No *Zorunlu and Benzersiz Olmalı*", placeholder="Örn: URT-2026-001")
+                    with ec2:
+                        isci_sayisi = st.number_input("İşçi Sayısı", min_value=1, step=1, value=10)
+                    with ec3:
+                        calisma_suresi_saat = st.number_input("Çalışma Süresi (Saat)", min_value=0.0, step=0.5, value=8.0)
+                    gunluk_isci_maliyeti = 0.0
+                    ek_giderler = 0.0
+                    toplam_iscilik_gideri = 0.0
+                    st.caption("Üretim maliyetleri bu kullanıcı rolünde gizlidir.")
 
                 aciklama = st.text_area("Üretim Notları / Açıklama")
 
-                submitted = st.form_submit_button("Üretimi, Sarfiyatı, Fireyi and Maliyeti Onayla")
+                submitted = st.form_submit_button("Üretimi ve Sarfiyatı Onayla" if not can_view_financial else "Üretimi, Sarfiyatı, Fireyi and Maliyeti Onayla")
                 
                 if submitted:
                     secilen_recete = [(m, a) for m, a in recete_secimleri if m != "Seçiniz..." and a > 0]
@@ -1112,7 +1129,8 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 with col_f1:
                     st.markdown(f"**Üretilen Ürün:** {mamul_satir['StokKodu']} - {mamul_satir['StokAdi']}")
                     st.markdown(f"**Üretilen Miktar:** {mamul_satir['Miktar']:,.2f} {mamul_satir['Birim']}")
-                    st.markdown(f"**Toplam Üretim Maliyeti:** {mamul_satir['ToplamTutar']:,.2f} TL (Birim: {mamul_satir['BirimFiyat']:,.2f} TL)")
+                    if can_view_financial:
+                        st.markdown(f"**Toplam Üretim Maliyeti:** {mamul_satir['ToplamTutar']:,.2f} TL (Birim: {mamul_satir['BirimFiyat']:,.2f} TL)")
                     st.markdown(f"**Mevcut Not:** {mevcut_not}")
                 with col_f2:
                     if mevcut_foto and os.path.exists(mevcut_foto):
@@ -1155,7 +1173,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     "PartiNo": p_no,
                                     "BirimFiyat": g_row["BirimFiyat"],
                                     "KalanMiktar": kalan_mik,
-                                    "Etiket": f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {g_row['BirimFiyat']:,.2f} TL | Kalan: {kalan_mik:,.2f} {g_row['Birim']}"
+                                    "Etiket": (f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {g_row['BirimFiyat']:,.2f} TL | Kalan: {kalan_mik:,.2f} {g_row['Birim']}" if can_view_financial else f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Kalan: {kalan_mik:,.2f} {g_row['Birim']}")
                                 })
                         df_aktif_partiler_ed = pd.DataFrame(parti_stoklari_ed)
                         aktif_parti_secenekleri_ed = df_aktif_partiler_ed["Etiket"].tolist() if not df_aktif_partiler_ed.empty else []
@@ -1204,7 +1222,11 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                             with fc2:
                                 f_amt_ed = st.number_input(f"Fire Miktar {j+1}", min_value=0.0, value=def_f_mik, step=1.0, format="%.2f", key=f"edit_fire_amt_{secilen_is_emri}_{j}")
                             with fc3:
-                                f_fiyat_ed = st.number_input(f"Birim Değer {j+1} (TL)", min_value=0.0, value=def_f_fiy, step=0.01, format="%.2f", key=f"edit_fire_price_{secilen_is_emri}_{j}")
+                                if can_view_financial:
+                                    f_fiyat_ed = st.number_input(f"Birim Değer {j+1} (TL)", min_value=0.0, value=def_f_fiy, step=0.01, format="%.2f", key=f"edit_fire_price_{secilen_is_emri}_{j}")
+                                else:
+                                    f_fiyat_ed = def_f_fiy
+                                    st.caption("Değer gizli")
                             edit_fire_secimleri.append((f_sec_ed, f_amt_ed, f_fiyat_ed))
 
                         st.markdown("---")
@@ -1213,7 +1235,11 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                         with ed_col1:
                             yeni_sure = st.number_input("Çalışma Süresi (Saat)", min_value=0.0, value=mevcut_sure, step=0.5)
                         with ed_col2:
-                            yeni_gider = st.number_input("Toplam Personel & Ek Gider (TL)", min_value=0.0, value=mevcut_gider, step=100.0, format="%.2f")
+                            if can_view_financial:
+                                yeni_gider = st.number_input("Toplam Personel & Ek Gider (TL)", min_value=0.0, value=mevcut_gider, step=100.0, format="%.2f")
+                            else:
+                                yeni_gider = mevcut_gider
+                                st.caption("Maliyet bilgisi yönetici yetkisindedir.")
                         
                         yeni_fotograf = st.file_uploader("Yeni / Değiştirilecek Fotoğraf Yükle", type=["png", "jpg", "jpeg"], key=f"up_{secilen_is_emri}")
                         yeni_not = st.text_area("Föy / Üretim Notunu Güncelle", value=mevcut_not)
@@ -1400,11 +1426,14 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 kalan_lot_adedi += 1
 
         st.markdown("---")
-        col_kpi1, col_kpi2 = st.columns(2)
-        with col_kpi1:
-            depo_etiketi = secilen_depo_filtre if secilen_depo_filtre != "Tümü" else "Tüm Depolar"
-            st.metric(label=f"💰 Depoda Kalan Malların Bedeli ({depo_etiketi})", value=f"{kalan_stok_degeri:,.2f} TL")
-        with col_kpi2:
+        if can_view_financial:
+            col_kpi1, col_kpi2 = st.columns(2)
+            with col_kpi1:
+                depo_etiketi = secilen_depo_filtre if secilen_depo_filtre != "Tümü" else "Tüm Depolar"
+                st.metric(label=f"💰 Depoda Kalan Malların Bedeli ({depo_etiketi})", value=f"{kalan_stok_degeri:,.2f} TL")
+            with col_kpi2:
+                st.metric(label="📦 Stokta Kalan Lot Sayısı", value=f"{kalan_lot_adedi:,} Adet")
+        else:
             st.metric(label="📦 Stokta Kalan Lot Sayısı", value=f"{kalan_lot_adedi:,} Adet")
         st.markdown("---")
 
@@ -1498,9 +1527,14 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
             hk1.metric("⬇️ Toplam Giriş", f"{toplam_giris:,.2f} {birim}")
             hk2.metric("⬆️ Toplam Çıkış", f"{toplam_cikis:,.2f} {birim}")
             hk3.metric("📦 Net Stok", f"{net_stok:,.2f} {birim}")
-            gosterim_kolonlari = ["Tarih", "HareketTuru", "Depo", "PartiNo", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "Tedarikci", "Aciklama"]
-            kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
-            st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}", "BirimFiyat":"{:,.2f} TL", "ToplamTutar":"{:,.2f} TL"}), use_container_width=True)
+            if can_view_financial:
+                gosterim_kolonlari = ["Tarih", "HareketTuru", "Depo", "PartiNo", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "Tedarikci", "Aciklama"]
+                kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
+                st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}", "BirimFiyat":"{:,.2f} TL", "ToplamTutar":"{:,.2f} TL"}), use_container_width=True)
+            else:
+                gosterim_kolonlari = ["Tarih", "HareketTuru", "Depo", "PartiNo", "Miktar", "Birim", "Tedarikci", "Aciklama"]
+                kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
+                st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}"}), use_container_width=True)
 
             # Seçilen stok kartının giriş / çıkış hareketlerini Excel'e aktar
             def convert_stock_card_movements_to_excel(df):
