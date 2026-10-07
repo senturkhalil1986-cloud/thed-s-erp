@@ -96,6 +96,30 @@ def user_count():
             cur.execute('SELECT COUNT(*) FROM public.erp_users')
             return cur.fetchone()[0]
 
+def list_users():
+    """Yönetim paneli için kullanıcı adı, rol ve aktiflik durumunu getirir."""
+    with pg_conn() as conn:
+        return pd.read_sql_query(
+            'SELECT username, role, active FROM public.erp_users ORDER BY username',
+            conn,
+        )
+
+def update_user_access(username, role, active):
+    """Bir kullanıcının rolünü ve aktif/pasif durumunu günceller."""
+    username = str(username).strip()
+    if not username:
+        raise ValueError("Kullanıcı adı boş olamaz.")
+    if username == st.session_state.get("username") and not active:
+        raise ValueError("Açık olan kendi yönetici hesabınızı pasif yapamazsınız.")
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                'UPDATE public.erp_users SET role=%s, active=%s WHERE username=%s',
+                (role, bool(active), username),
+            )
+            if cur.rowcount == 0:
+                raise ValueError("Kullanıcı bulunamadı.")
+
 def authenticate(username, password):
     with pg_conn() as conn:
         with conn.cursor() as cur:
@@ -356,6 +380,64 @@ if st.session_state.get("role") == "admin":
                 st.error("Bu kullanıcı adı zaten kayıtlı.")
             except Exception as exc:
                 st.error(str(exc))
+
+        st.markdown("---")
+        st.markdown("**Mevcut Kullanıcılar**")
+        try:
+            users_df = list_users()
+            st.caption(f"Toplam Kullanıcı: {len(users_df)}")
+            if users_df.empty:
+                st.info("Henüz kayıtlı kullanıcı bulunmuyor.")
+            else:
+                user_view = users_df.copy()
+                user_view["Rol"] = user_view["role"].map(lambda r: ROLE_LABELS.get(r, r))
+                user_view["Durum"] = user_view["active"].map(lambda a: "🟢 Aktif" if bool(a) else "🔴 Pasif")
+                st.dataframe(
+                    user_view[["username", "Rol", "Durum"]].rename(columns={"username": "Kullanıcı"}),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                selected_user = st.selectbox(
+                    "Düzenlenecek kullanıcı",
+                    user_view["username"].tolist(),
+                    key="admin_selected_user",
+                )
+                selected_row = users_df[users_df["username"] == selected_user].iloc[0]
+                role_options = ["depo", "uretim", "satis", "yonetici", "admin"]
+                current_user_role = selected_row["role"] if selected_row["role"] in role_options else "depo"
+                edit_role = st.selectbox(
+                    "Kullanıcı rolü",
+                    role_options,
+                    index=role_options.index(current_user_role),
+                    format_func=lambda r: ROLE_LABELS.get(r, r),
+                    key=f"edit_role_{selected_user}",
+                )
+                edit_active = st.checkbox(
+                    "Kullanıcı aktif",
+                    value=bool(selected_row["active"]),
+                    key=f"edit_active_{selected_user}",
+                )
+                if st.button("Kullanıcı Yetkisini Güncelle", key=f"update_user_{selected_user}"):
+                    old_access = {
+                        "rol": selected_row["role"],
+                        "aktif": bool(selected_row["active"]),
+                    }
+                    try:
+                        update_user_access(selected_user, edit_role, edit_active)
+                        audit_log(
+                            "GÜNCELLEME",
+                            "KULLANICI",
+                            selected_user,
+                            old_value=old_access,
+                            new_value={"rol": edit_role, "aktif": bool(edit_active)},
+                        )
+                        st.success("Kullanıcı yetkisi güncellendi.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Kullanıcı listesi alınamadı: {exc}")
     with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
         st.caption("Sunucudaki geçici dosya/fotoğraf klasörünü kontrol eder. Ana ERP kayıtları Supabase veritabanındadır.")
         import zipfile
