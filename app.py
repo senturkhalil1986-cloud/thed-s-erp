@@ -209,6 +209,20 @@ def load_data(filepath, columns):
         logging.exception("DB_READ_ERROR table=%s", table)
         raise RuntimeError(f"Supabase verisi okunamadı: {table}") from exc
 
+def generate_auto_parti_no(giris_tarihi):
+    """Depo girişleri için G-YYMMDD-001 biçiminde sıradaki benzersiz parti numarasını üretir."""
+    tarih = pd.to_datetime(giris_tarihi).date()
+    prefix = f"G-{tarih.strftime('%y%m%d')}-"
+    tx_check_df = load_data(STOCK_TRANSACTIONS_FILE, ["PartiNo"])
+    max_seq = 0
+    if not tx_check_df.empty and "PartiNo" in tx_check_df.columns:
+        for value in tx_check_df["PartiNo"].dropna().astype(str).str.strip():
+            if value.startswith(prefix):
+                suffix = value[len(prefix):]
+                if suffix.isdigit():
+                    max_seq = max(max_seq, int(suffix))
+    return f"{prefix}{max_seq + 1:03d}"
+
 def _pg_value(v):
     if pd.isna(v):
         return None
@@ -557,47 +571,41 @@ elif choice == "2. Depo / Malzeme Girişi":
                 miktar = st.number_input("Giriş Miktarı", min_value=0.01, step=1.0, format="%.2f")
             with col2:
                 birim_fiyat = st.number_input("Birim Fiyat (TL) *Zorunlu*", min_value=0.01, step=0.01, value=1.0, format="%.2f")
-                parti_no = st.text_input("Parti / Lot Numarası *Zorunlu and Benzersiz Olmalı*")
+                onizleme_parti_no = generate_auto_parti_no(g_tarih)
+                st.text_input("Parti / Lot Numarası (Otomatik)", value=onizleme_parti_no, disabled=True)
+                st.caption("Parti numarası kayıt anında otomatik ve benzersiz olarak oluşturulur.")
                 tedarikci = st.text_input("Tedarikçi / Cari Firma Adı")
                 irsaliye_no = st.text_input("İrsaliye / Fatura No")
 
             submitted = st.form_submit_button("Depoya Girişi Onayla")
             if submitted:
-                if not parti_no.strip():
-                    st.error("Parti / Lot numarası zorunludur!")
-                elif birim_fiyat <= 0:
+                if birim_fiyat <= 0:
                     st.error("Birim fiyat sıfırdan büyük olmalıdır!")
                 elif miktar <= 0:
                     st.error("Miktar sıfırdan büyük olmalıdır!")
                 else:
-                    tx_check_df = load_data(STOCK_TRANSACTIONS_FILE, ["PartiNo"])
-                    existing_parties = []
-                    if not tx_check_df.empty and "PartiNo" in tx_check_df.columns:
-                        existing_parties = tx_check_df["PartiNo"].astype(str).str.strip().values
+                    # Kayıt anında tekrar hesaplanır; ekranda beklerken başka giriş yapılmışsa sıra çakışmaz.
+                    parti_no = generate_auto_parti_no(g_tarih)
+                    new_tx = pd.DataFrame([{
+                        "Tarih": str(g_tarih),
+                        "HareketTuru": "Giriş",
+                        "Depo": default_depo,
+                        "StokKodu": selected_item_row["StokKodu"],
+                        "StokAdi": selected_item_row["StokAdi"],
+                        "Birim": selected_item_row["Birim"],
+                        "Miktar": miktar,
+                        "BirimFiyat": birim_fiyat,
+                        "ToplamTutar": miktar * birim_fiyat,
+                        "PartiNo": parti_no.strip(),
+                        "Tedarikci": tedarikci.strip(),
+                        "Aciklama": f"İrsaliye: {irsaliye_no.strip()}"
+                    }])
 
-                    if parti_no.strip() in existing_parties:
-                        st.error(f"🚨 Hata: '{parti_no.strip()}' parti/lot numarası sistemde zaten kayıtlı!")
-                    else:
-                        new_tx = pd.DataFrame([{
-                            "Tarih": str(g_tarih),
-                            "HareketTuru": "Giriş",
-                            "Depo": default_depo,
-                            "StokKodu": selected_item_row["StokKodu"],
-                            "StokAdi": selected_item_row["StokAdi"],
-                            "Birim": selected_item_row["Birim"],
-                            "Miktar": miktar,
-                            "BirimFiyat": birim_fiyat,
-                            "ToplamTutar": miktar * birim_fiyat,
-                            "PartiNo": parti_no.strip(),
-                            "Tedarikci": tedarikci.strip(),
-                            "Aciklama": f"İrsaliye: {irsaliye_no.strip()}"
-                        }])
-                        
-                        tx_df = load_data(STOCK_TRANSACTIONS_FILE, new_tx.columns.tolist())
-                        tx_df = pd.concat([tx_df, new_tx], ignore_index=True)
-                        save_data(tx_df, STOCK_TRANSACTIONS_FILE)
-                        audit_log("OLUŞTURMA", "DEPO_GIRISI", parti_no.strip(), new_value=new_tx)
-                        st.success(f"Depo girişi başarıyla işlendi! ({default_depo} - Parti No: {parti_no})")
+                    tx_df = load_data(STOCK_TRANSACTIONS_FILE, new_tx.columns.tolist())
+                    tx_df = pd.concat([tx_df, new_tx], ignore_index=True)
+                    save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                    audit_log("OLUŞTURMA", "DEPO_GIRISI", parti_no.strip(), new_value=new_tx)
+                    st.success(f"Depo girişi başarıyla işlendi! ({default_depo} - Parti No: {parti_no})")
 
     st.subheader("📑 Son Yapılan Depo Giriş Hareketleri ve Silme")
     tx_history = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Birim", "Miktar", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
