@@ -394,6 +394,137 @@ def read_warehouse_receipt_file(storage_path, legacy_file_data=None):
         return bytes(legacy_file_data)
     return b""
 
+def _storage_request_for_bucket(method, bucket, storage_path, data=None, content_type=None):
+    """Mevcut Supabase secret ile belirtilen private bucket üzerinde işlem yapar."""
+    try:
+        cfg = st.secrets["supabase"]
+        base_url = str(cfg["url"]).rstrip("/")
+        key = str(cfg["service_key"])
+    except Exception as exc:
+        raise RuntimeError("Supabase Storage ayarı eksik. [supabase] url ve service_key kontrol edin.") from exc
+    encoded_path = urllib.parse.quote(str(storage_path).lstrip('/'), safe='/')
+    endpoint = f"{base_url}/storage/v1/object/{bucket}/{encoded_path}"
+    headers = {"Authorization": f"Bearer {key}", "apikey": key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if method == "POST":
+        headers["x-upsert"] = "false"
+    req = urllib.request.Request(endpoint, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read()
+    except Exception as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"Supabase Storage işlemi başarısız: {detail or exc}") from exc
+
+
+def ensure_sample_tracking_table():
+    """Numune takip ana tablosunu oluşturur / günceller."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.sample_tracking (
+                    id BIGSERIAL PRIMARY KEY,
+                    takip_no TEXT NOT NULL UNIQUE,
+                    tarih DATE NOT NULL,
+                    firma TEXT NOT NULL,
+                    urun_adi TEXT NOT NULL,
+                    urun_ozellikleri TEXT NOT NULL,
+                    recete TEXT NOT NULL,
+                    miktar NUMERIC NOT NULL,
+                    birim TEXT NOT NULL,
+                    gonderim_bilgisi TEXT NOT NULL,
+                    gorsel_adi TEXT NOT NULL,
+                    gorsel_mime TEXT,
+                    gorsel_storage_path TEXT NOT NULL,
+                    durum TEXT NOT NULL DEFAULT 'Değerlendirme Bekleniyor',
+                    musteri_onerisi TEXT,
+                    olusturan TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sample_tracking_takip_no ON public.sample_tracking(takip_no)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sample_tracking_firma ON public.sample_tracking(firma)")
+
+
+def generate_sample_tracking_no(tarih):
+    ensure_sample_tracking_table()
+    d = pd.to_datetime(tarih).date()
+    prefix = f"NUM-{d.strftime('%y%m%d')}-"
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT takip_no FROM public.sample_tracking WHERE takip_no LIKE %s", (prefix + "%",))
+            values = [r[0] for r in cur.fetchall()]
+    max_seq = 0
+    for value in values:
+        try:
+            max_seq = max(max_seq, int(str(value).rsplit('-', 1)[1]))
+        except Exception:
+            pass
+    return f"{prefix}{max_seq + 1:03d}"
+
+
+def save_sample_record(tarih, firma, urun_adi, urun_ozellikleri, recete, miktar, birim, gonderim_bilgisi, uploaded_image):
+    ensure_sample_tracking_table()
+    takip_no = generate_sample_tracking_no(tarih)
+    if uploaded_image is None:
+        raise ValueError("Ürün görseli zorunludur.")
+    file_bytes = uploaded_image.getvalue()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise ValueError("Ürün görseli 10 MB'dan büyük olamaz.")
+    safe_name = _safe_storage_name(uploaded_image.name)
+    mime_type = uploaded_image.type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    storage_path = f"{takip_no}/urun_{secrets.token_hex(6)}_{safe_name}"
+    _storage_request_for_bucket("POST", "numune-gorselleri", storage_path, data=file_bytes, content_type=mime_type)
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.sample_tracking
+                    (takip_no,tarih,firma,urun_adi,urun_ozellikleri,recete,miktar,birim,gonderim_bilgisi,
+                     gorsel_adi,gorsel_mime,gorsel_storage_path,durum,musteri_onerisi,olusturan)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (takip_no, tarih, firma.strip(), urun_adi.strip(), urun_ozellikleri.strip(), recete.strip(),
+                      float(miktar), birim.strip(), gonderim_bilgisi.strip(), uploaded_image.name, mime_type,
+                      storage_path, "Değerlendirme Bekleniyor", "", st.session_state.get("username", "system")))
+    except Exception:
+        try:
+            _storage_request_for_bucket("DELETE", "numune-gorselleri", storage_path)
+        except Exception:
+            logging.exception("ORPHAN_SAMPLE_IMAGE path=%s", storage_path)
+        raise
+    return takip_no
+
+
+def load_sample_records():
+    ensure_sample_tracking_table()
+    with pg_conn() as conn:
+        return pd.read_sql_query("""
+            SELECT id,takip_no,tarih,firma,urun_adi,urun_ozellikleri,recete,miktar,birim,gonderim_bilgisi,
+                   gorsel_adi,gorsel_mime,gorsel_storage_path,durum,musteri_onerisi,olusturan,created_at,updated_at
+            FROM public.sample_tracking ORDER BY id DESC
+        """, conn)
+
+
+def update_sample_feedback(takip_no, durum, musteri_onerisi):
+    allowed = {"Değerlendirme Bekleniyor", "Onaylandı", "Revize İstendi", "Reddedildi"}
+    if durum not in allowed:
+        raise ValueError("Geçersiz numune durumu.")
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.sample_tracking
+                SET durum=%s, musteri_onerisi=%s, updated_at=NOW()
+                WHERE takip_no=%s
+            """, (durum, str(musteri_onerisi or "").strip(), takip_no))
+            if cur.rowcount == 0:
+                raise ValueError("Numune kaydı bulunamadı.")
+
 def generate_auto_parti_no(giris_tarihi):
     """Depo girişleri için G-YYMMDD-001 biçiminde sıradaki benzersiz parti numarasını üretir."""
     tarih = pd.to_datetime(giris_tarihi).date()
@@ -474,7 +605,8 @@ ALL_MENU = [
     "4. Üretime Sevk / Reçeteli Üretim and Maliyet",
     "5. Stok Durumu, Hareket Panosu and Föy Düzenleme",
     "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)",
-    "7. İzlenebilirlik & İşlem Geçmişi"
+    "7. İzlenebilirlik & İşlem Geçmişi",
+    "8. Numune Takip"
 ]
 
 # Rol bazlı modül yetkileri. Admin tüm modüllere erişir.
@@ -489,9 +621,9 @@ ROLE_LABELS = {
 ROLE_MODULES = {
     "admin": ALL_MENU,
     "yonetici": ALL_MENU,
-    "depo": [ALL_MENU[2], ALL_MENU[4], ALL_MENU[5], ALL_MENU[7]],
-    "uretim": [ALL_MENU[4], ALL_MENU[5], ALL_MENU[7]],
-    "satis": [ALL_MENU[6], ALL_MENU[7]],
+    "depo": [ALL_MENU[2], ALL_MENU[4], ALL_MENU[5], ALL_MENU[7], ALL_MENU[8]],
+    "uretim": [ALL_MENU[4], ALL_MENU[5], ALL_MENU[7], ALL_MENU[8]],
+    "satis": [ALL_MENU[6], ALL_MENU[7], ALL_MENU[8]],
     # Eski kullanıcıların erişimini bir anda bozmamak için geriye dönük uyumluluk.
     "personel": ALL_MENU[1:],
 }
@@ -2345,3 +2477,169 @@ elif choice == "7. İzlenebilirlik & İşlem Geçmişi":
                     st.markdown("**Yeni değer**")
                     try: st.json(json.loads(drow["new_value"]) if drow["new_value"] else {})
                     except Exception: st.code(str(drow["new_value"] or ""))
+
+
+# --- 8. NUMUNE TAKİP ---
+elif choice == "8. Numune Takip":
+    st.header("🧪 Numune Takip Modülü")
+    st.caption("Gönderilen numuneleri takip numarası, reçete, ürün özellikleri, görsel ve müşteri geri bildirimiyle tek yerde izleyin.")
+
+    tab_new, tab_list = st.tabs(["➕ Yeni Numune Kaydı", "📋 Numune Takip Listesi"])
+
+    with tab_new:
+        sample_date = st.date_input("Numune / Gönderim Tarihi", datetime.now(), key="sample_date")
+        preview_no = generate_sample_tracking_no(sample_date)
+        st.text_input("Numune Takip No (Otomatik)", value=preview_no, disabled=True)
+        st.caption("Takip numarası kayıt anında otomatik ve benzersiz oluşturulur.")
+
+        with st.form("sample_tracking_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                firma = st.text_input("Gönderilen Firma *")
+                urun_adi = st.text_input("Ürün Adı *")
+                miktar = st.number_input("Numune Miktarı *", min_value=0.01, step=0.01, format="%.2f")
+                birim = st.selectbox("Birim *", ["g", "kg", "ml", "L", "Adet", "Paket", "Kavanoz"])
+            with c2:
+                gonderim_bilgisi = st.text_input("Gönderim / Kargo Bilgisi *", placeholder="Örn: DHL - 123456789")
+                urun_gorseli = st.file_uploader("Ürün Görseli *", type=["jpg", "jpeg", "png"], key="sample_product_image")
+                st.caption("Ürün görseli zorunludur. Azami 10 MB.")
+
+            urun_ozellikleri = st.text_area(
+                "Ürün Özellikleri / Spesifikasyonu *",
+                height=140,
+                placeholder="Ürünün teknik ve duyusal özelliklerini yazın."
+            )
+            recete = st.text_area(
+                "Reçete *",
+                height=180,
+                placeholder="Numunede kullanılan reçeteyi ve miktarları yazın."
+            )
+            submitted_sample = st.form_submit_button("🧪 Numune Kaydını Oluştur")
+
+        if submitted_sample:
+            missing = []
+            if not firma.strip(): missing.append("Gönderilen Firma")
+            if not urun_adi.strip(): missing.append("Ürün Adı")
+            if not urun_ozellikleri.strip(): missing.append("Ürün Özellikleri")
+            if not recete.strip(): missing.append("Reçete")
+            if not gonderim_bilgisi.strip(): missing.append("Gönderim / Kargo Bilgisi")
+            if urun_gorseli is None: missing.append("Ürün Görseli")
+            if missing:
+                st.error("Zorunlu alanları doldurun: " + ", ".join(missing))
+            elif urun_gorseli.size > 10 * 1024 * 1024:
+                st.error("Ürün görseli 10 MB'dan büyük olamaz.")
+            else:
+                try:
+                    takip_no = save_sample_record(
+                        sample_date, firma, urun_adi, urun_ozellikleri, recete,
+                        miktar, birim, gonderim_bilgisi, urun_gorseli
+                    )
+                    audit_log("OLUŞTURMA", "NUMUNE", takip_no, new_value={
+                        "firma": firma, "urun": urun_adi, "miktar": float(miktar), "birim": birim,
+                        "durum": "Değerlendirme Bekleniyor"
+                    })
+                    st.success(f"Numune kaydı oluşturuldu. Takip No: {takip_no}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Numune kaydı oluşturulamadı: {exc}")
+
+    with tab_list:
+        try:
+            sample_df = load_sample_records()
+        except Exception as exc:
+            st.error(f"Numune kayıtları alınamadı: {exc}")
+            sample_df = pd.DataFrame()
+
+        if sample_df.empty:
+            st.info("Henüz numune kaydı bulunmuyor.")
+        else:
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                q = st.text_input("Ara", placeholder="Takip no, firma veya ürün")
+            with f2:
+                status_options = ["Tümü", "Değerlendirme Bekleniyor", "Onaylandı", "Revize İstendi", "Reddedildi"]
+                status_filter = st.selectbox("Durum", status_options)
+            with f3:
+                firm_options = ["Tümü"] + sorted(sample_df["firma"].dropna().astype(str).unique().tolist())
+                firm_filter = st.selectbox("Firma", firm_options)
+
+            view = sample_df.copy()
+            if q.strip():
+                needle = q.strip().lower()
+                mask = (
+                    view["takip_no"].astype(str).str.lower().str.contains(needle, regex=False) |
+                    view["firma"].astype(str).str.lower().str.contains(needle, regex=False) |
+                    view["urun_adi"].astype(str).str.lower().str.contains(needle, regex=False)
+                )
+                view = view[mask]
+            if status_filter != "Tümü":
+                view = view[view["durum"] == status_filter]
+            if firm_filter != "Tümü":
+                view = view[view["firma"] == firm_filter]
+
+            st.metric("Toplam Numune", len(view))
+            display_cols = ["takip_no","tarih","firma","urun_adi","miktar","birim","gonderim_bilgisi","durum","musteri_onerisi","olusturan"]
+            display = view[display_cols].rename(columns={
+                "takip_no":"Takip No", "tarih":"Tarih", "firma":"Firma", "urun_adi":"Ürün",
+                "miktar":"Miktar", "birim":"Birim", "gonderim_bilgisi":"Gönderim / Kargo",
+                "durum":"Durum", "musteri_onerisi":"Müşteri Önerisi", "olusturan":"Kaydeden"
+            })
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            excel_export = view[["takip_no","tarih","firma","urun_adi","urun_ozellikleri","recete","miktar","birim",
+                                 "gonderim_bilgisi","durum","musteri_onerisi","olusturan","created_at","updated_at"]].copy()
+            excel_export.columns = ["Numune Takip No","Tarih","Gönderilen Firma","Ürün Adı","Ürün Özellikleri","Reçete",
+                                    "Miktar","Birim","Gönderim / Kargo Bilgisi","Durum","Müşteri Önerisi","Kaydeden",
+                                    "Kayıt Tarihi","Son Güncelleme"]
+            excel_html = excel_export.to_html(index=False, border=1)
+            excel_bytes = ("<html><head><meta charset='utf-8'></head><body>" + excel_html + "</body></html>").encode("utf-8")
+            st.download_button(
+                "📥 Numune Takip Listesini Excel'e Aktar (.xls)",
+                data=excel_bytes,
+                file_name=f"numune_takip_{datetime.now().strftime('%Y%m%d_%H%M')}.xls",
+                mime="application/vnd.ms-excel"
+            )
+
+            st.markdown("### 🔎 Numune Detayı / Müşteri Geri Bildirimi")
+            detail_options = view["takip_no"].astype(str).tolist()
+            if detail_options:
+                selected_no = st.selectbox("Numune Takip No", detail_options, key="sample_detail_no")
+                row = sample_df[sample_df["takip_no"].astype(str) == selected_no].iloc[0]
+                d1, d2 = st.columns([1, 1])
+                with d1:
+                    st.markdown(f"**Firma:** {row['firma']}")
+                    st.markdown(f"**Ürün:** {row['urun_adi']}")
+                    st.markdown(f"**Miktar:** {row['miktar']} {row['birim']}")
+                    st.markdown(f"**Gönderim / Kargo:** {row['gonderim_bilgisi']}")
+                    st.markdown("**Ürün Özellikleri**")
+                    st.text_area("Özellikler", value=str(row["urun_ozellikleri"]), height=130, disabled=True, label_visibility="collapsed", key=f"spec_{selected_no}")
+                    st.markdown("**Reçete**")
+                    st.text_area("Reçete Detayı", value=str(row["recete"]), height=160, disabled=True, label_visibility="collapsed", key=f"recipe_{selected_no}")
+                with d2:
+                    try:
+                        img = _storage_request_for_bucket("GET", "numune-gorselleri", row["gorsel_storage_path"])
+                        st.image(img, caption=f"{selected_no} - {row['gorsel_adi']}", use_container_width=True)
+                    except Exception as exc:
+                        st.warning(f"Ürün görseli açılamadı: {exc}")
+
+                status_values = ["Değerlendirme Bekleniyor", "Onaylandı", "Revize İstendi", "Reddedildi"]
+                current_status = row["durum"] if row["durum"] in status_values else "Değerlendirme Bekleniyor"
+                with st.form(f"sample_feedback_{selected_no}"):
+                    new_status = st.selectbox("Numune Durumu", status_values, index=status_values.index(current_status))
+                    customer_feedback = st.text_area(
+                        "Müşteri Önerisi / Geri Bildirimi",
+                        value="" if pd.isna(row["musteri_onerisi"]) else str(row["musteri_onerisi"]),
+                        height=140,
+                        placeholder="Örn: Tuz azaltılsın, renk daha koyu olsun, parça boyutu küçültülsün."
+                    )
+                    update_btn = st.form_submit_button("💾 Durum ve Müşteri Önerisini Kaydet")
+                if update_btn:
+                    try:
+                        old = {"durum": row["durum"], "musteri_onerisi": row["musteri_onerisi"]}
+                        update_sample_feedback(selected_no, new_status, customer_feedback)
+                        audit_log("GÜNCELLEME", "NUMUNE", selected_no, old_value=old,
+                                  new_value={"durum": new_status, "musteri_onerisi": customer_feedback})
+                        st.success("Numune durumu ve müşteri önerisi güncellendi.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Güncelleme yapılamadı: {exc}")
