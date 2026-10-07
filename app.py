@@ -245,6 +245,69 @@ def load_data(filepath, columns):
         logging.exception("DB_READ_ERROR table=%s", table)
         raise RuntimeError(f"Supabase verisi okunamadı: {table}") from exc
 
+def ensure_warehouse_receipt_files_table():
+    """Depo kabul görsellerini Supabase PostgreSQL içinde kalıcı olarak saklayan tabloyu hazırlar."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.warehouse_receipt_files (
+                    id BIGSERIAL PRIMARY KEY,
+                    parti_no TEXT NOT NULL,
+                    file_type TEXT NOT NULL CHECK (file_type IN ('urun', 'irsaliye')),
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT,
+                    file_data BYTEA NOT NULL,
+                    uploaded_by TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_warehouse_receipt_files_parti_no ON public.warehouse_receipt_files(parti_no)"
+            )
+
+def save_warehouse_receipt_file(parti_no, file_type, uploaded_file):
+    if uploaded_file is None:
+        return
+    ensure_warehouse_receipt_files_table()
+    file_bytes = uploaded_file.getvalue()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise ValueError(f"{uploaded_file.name} dosyası 10 MB sınırını aşıyor.")
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.warehouse_receipt_files
+                    (parti_no, file_type, file_name, mime_type, file_data, uploaded_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (str(parti_no).strip(), file_type, uploaded_file.name,
+                 uploaded_file.type or "application/octet-stream", psycopg2.Binary(file_bytes),
+                 st.session_state.get("username", "system"))
+            )
+
+def delete_warehouse_receipt_files(parti_no):
+    try:
+        ensure_warehouse_receipt_files_table()
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM public.warehouse_receipt_files WHERE parti_no=%s', (str(parti_no).strip(),))
+    except Exception:
+        logging.exception("WAREHOUSE_FILE_DELETE_ERROR parti=%s", parti_no)
+
+def load_warehouse_receipt_files(parti_no):
+    ensure_warehouse_receipt_files_table()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, file_type, file_name, mime_type, file_data, created_at
+                   FROM public.warehouse_receipt_files
+                   WHERE parti_no=%s ORDER BY id""",
+                (str(parti_no).strip(),)
+            )
+            return cur.fetchall()
+
 def generate_auto_parti_no(giris_tarihi):
     """Depo girişleri için G-YYMMDD-001 biçiminde sıradaki benzersiz parti numarasını üretir."""
     tarih = pd.to_datetime(giris_tarihi).date()
@@ -673,9 +736,33 @@ elif choice == "2. Depo / Malzeme Girişi":
                 tedarikci = st.text_input("Tedarikçi / Cari Firma Adı")
                 irsaliye_no = st.text_input("İrsaliye / Fatura No")
 
+            st.markdown("### 📎 Mal Kabul Görselleri / Belgeleri")
+            foto_col, irs_col = st.columns(2)
+            with foto_col:
+                uploaded_warehouse_product = st.file_uploader(
+                    "📷 Ürün Görseli *Zorunlu*",
+                    type=["jpg", "jpeg", "png"],
+                    key="warehouse_product_photo",
+                    help="Mal kabul sırasında ürünün gerçek fotoğrafını yükleyin. Kayıt için zorunludur."
+                )
+            with irs_col:
+                uploaded_warehouse_delivery = st.file_uploader(
+                    "📄 İrsaliye Görseli / PDF (Opsiyonel)",
+                    type=["jpg", "jpeg", "png", "pdf"],
+                    key="warehouse_delivery_doc",
+                    help="İrsaliye yüklemek zorunlu değildir."
+                )
+            st.caption("Ürün fotoğrafı olmadan depo girişi kaydedilemez. Dosya başına azami 10 MB.")
+
             submitted = st.form_submit_button("Depoya Girişi Onayla")
             if submitted:
-                if birim_fiyat <= 0:
+                if uploaded_warehouse_product is None:
+                    st.error("📷 Ürün görseli zorunludur. Lütfen mal kabul fotoğrafını yükleyin!")
+                elif uploaded_warehouse_product.size > 10 * 1024 * 1024:
+                    st.error("Ürün görseli 10 MB'dan büyük olamaz.")
+                elif uploaded_warehouse_delivery is not None and uploaded_warehouse_delivery.size > 10 * 1024 * 1024:
+                    st.error("İrsaliye dosyası 10 MB'dan büyük olamaz.")
+                elif birim_fiyat <= 0:
                     st.error("Birim fiyat sıfırdan büyük olmalıdır!")
                 elif miktar <= 0:
                     st.error("Miktar sıfırdan büyük olmalıdır!")
@@ -699,9 +786,18 @@ elif choice == "2. Depo / Malzeme Girişi":
 
                     tx_df = load_data(STOCK_TRANSACTIONS_FILE, new_tx.columns.tolist())
                     tx_df = pd.concat([tx_df, new_tx], ignore_index=True)
-                    save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                    # Ürün fotoğrafı zorunlu olduğu için önce ekleri kalıcı veritabanına kaydet.
+                    # Stok kaydı başarısız olursa ekler temizlenir; böylece yarım kayıt bırakılmaz.
+                    try:
+                        save_warehouse_receipt_file(parti_no, "urun", uploaded_warehouse_product)
+                        if uploaded_warehouse_delivery is not None:
+                            save_warehouse_receipt_file(parti_no, "irsaliye", uploaded_warehouse_delivery)
+                        save_data(tx_df, STOCK_TRANSACTIONS_FILE)
+                    except Exception:
+                        delete_warehouse_receipt_files(parti_no)
+                        raise
                     audit_log("OLUŞTURMA", "DEPO_GIRISI", parti_no.strip(), new_value=new_tx)
-                    st.success(f"Depo girişi başarıyla işlendi! ({default_depo} - Parti No: {parti_no})")
+                    st.success(f"Depo girişi ve ürün görseli başarıyla kaydedildi! ({default_depo} - Parti No: {parti_no})")
 
     st.subheader("📑 Son Yapılan Depo Giriş Hareketleri ve Silme")
     tx_history = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Birim", "Miktar", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
@@ -715,6 +811,27 @@ elif choice == "2. Depo / Malzeme Girişi":
             "ToplamTutar": "{:,.2f} TL"
         }, na_rep="")
         st.dataframe(styled_giris, use_container_width=True)
+
+        with st.expander("📎 Mal Kabul Fotoğrafı / İrsaliye Arşivi"):
+            arsiv_partiler = giris_df["PartiNo"].dropna().astype(str).str.strip().tolist()
+            if arsiv_partiler:
+                arsiv_parti = st.selectbox("Eklerini görmek istediğin parti / lot", arsiv_partiler, key="warehouse_archive_lot")
+                try:
+                    arsiv_files = load_warehouse_receipt_files(arsiv_parti)
+                    if not arsiv_files:
+                        st.info("Bu lot için kayıtlı görsel veya belge bulunmuyor. Eski depo girişlerinde ek olmayabilir.")
+                    for file_id, file_type, file_name, mime_type, file_data, created_at in arsiv_files:
+                        data = bytes(file_data)
+                        baslik = "📷 Ürün Görseli" if file_type == "urun" else "📄 İrsaliye"
+                        st.markdown(f"**{baslik}: {file_name}**")
+                        if (mime_type or "").startswith("image/"):
+                            st.image(data, width=350)
+                        st.download_button(
+                            f"{baslik} İndir", data=data, file_name=file_name, mime=mime_type or "application/octet-stream",
+                            key=f"warehouse_file_{file_id}"
+                        )
+                except Exception as exc:
+                    st.error(f"Mal kabul ekleri açılamadı: {exc}")
         
         st.markdown("### 🗑️ Yanlış Girilen Depo Giriş Fişini / Lotunu Sil")
         giris_secenekleri = [f"Parti: {row['PartiNo']} | {row['StokAdi']} | Miktar: {row['Miktar']} {row['Birim']} | Tarih: {row['Tarih']}" for _, row in giris_df.iterrows()]
@@ -729,6 +846,7 @@ elif choice == "2. Depo / Malzeme Girişi":
                     silinen_depo_kaydi = tx_history[((tx_history["PartiNo"].astype(str).str.strip() == silinecek_parti) & (tx_history["HareketTuru"] == "Giriş"))].copy()
                     tx_history = tx_history[~((tx_history["PartiNo"].astype(str).str.strip() == silinecek_parti) & (tx_history["HareketTuru"] == "Giriş"))]
                     save_data(tx_history, STOCK_TRANSACTIONS_FILE)
+                    delete_warehouse_receipt_files(silinecek_parti)
                     audit_log("SILME", "DEPO_GIRISI", silinecek_parti, old_value=silinen_depo_kaydi)
                     st.success(f"'{silinecek_parti}' nolu depo giriş hareketi silindi!")
                     st.rerun()
