@@ -1488,6 +1488,8 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
             kart_hareketleri = tx_df[tx_df["StokKodu"].astype(str) == secilen_stok_kodu].copy()
             kart_hareketleri["Giriş Miktarı"] = kart_hareketleri.apply(lambda r: r["Miktar"] if r["HareketTuru"] == "Giriş" else 0.0, axis=1)
             kart_hareketleri["Çıkış Miktarı"] = kart_hareketleri.apply(lambda r: r["Miktar"] if r["HareketTuru"] == "Çıkış" else 0.0, axis=1)
+            kart_hareketleri["Giriş Miktarı"] = pd.to_numeric(kart_hareketleri["Giriş Miktarı"], errors="coerce").fillna(0)
+            kart_hareketleri["Çıkış Miktarı"] = pd.to_numeric(kart_hareketleri["Çıkış Miktarı"], errors="coerce").fillna(0)
             toplam_giris = kart_hareketleri["Giriş Miktarı"].sum()
             toplam_cikis = kart_hareketleri["Çıkış Miktarı"].sum()
             net_stok = toplam_giris - toplam_cikis
