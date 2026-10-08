@@ -56,13 +56,42 @@ def init_audit_table():
     return None
 
 def _json_safe(value):
+    """Audit verilerini PostgreSQL JSON alanına uygun Python tiplerine çevir."""
+    from decimal import Decimal
+    from datetime import date, time
+    import math
+
     if value is None:
         return None
     if isinstance(value, pd.DataFrame):
-        value = value.to_dict(orient="records")
-    elif isinstance(value, pd.Series):
-        value = value.to_dict()
-    return value
+        return _json_safe(value.to_dict(orient="records"))
+    if isinstance(value, pd.Series):
+        return _json_safe(value.to_dict())
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Decimal):
+        return str(value) if value.is_finite() else None
+    if isinstance(value, (datetime, date, time, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
+    if hasattr(value, "item") and callable(value.item):
+        try:
+            return _json_safe(value.item())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 def audit_log(action, entity_type, entity_id, old_value=None, new_value=None):
     with pg_conn() as conn:
