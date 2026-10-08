@@ -56,12 +56,31 @@ def init_audit_table():
     return None
 
 def _json_safe(value):
-    if value is None:
+    """Denetim kaydindaki pandas/numpy/tarih degerlerini JSON uyumlu hale getirir."""
+    from datetime import date, time
+    from decimal import Decimal
+    import math
+
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
     if isinstance(value, pd.DataFrame):
-        value = value.to_dict(orient="records")
-    elif isinstance(value, pd.Series):
-        value = value.to_dict()
+        return [_json_safe(row) for row in value.to_dict(orient="records")]
+    if isinstance(value, pd.Series):
+        return _json_safe(value.to_dict())
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (datetime, date, time, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    if hasattr(value, "item") and callable(value.item):
+        return _json_safe(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value
 
 def audit_log(action, entity_type, entity_id, old_value=None, new_value=None):
