@@ -2060,57 +2060,94 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
                 st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}"}), use_container_width=True)
 
-            # Seçilen stok kartının giriş / çıkış hareketlerini Excel'e aktar
-            def convert_stock_card_movements_to_excel(df):
-                export_df = df.copy()
-                export_df = export_df.rename(columns={
-                    "HareketTuru": "Hareket Türü",
-                    "PartiNo": "Parti / Lot No",
-                    "BirimFiyat": "Birim Fiyat (TL)",
-                    "ToplamTutar": "Toplam Tutar (TL)",
-                    "Tedarikci": "Tedarikçi / İş Emri",
-                    "Aciklama": "Açıklama"
-                })
-                html_table = export_df.to_html(index=False, escape=False)
-                excel_html = f"""
-                <html xmlns:o="urn:schemas-microsoft-com:office:office"
-                      xmlns:x="urn:schemas-microsoft-com:office:excel"
-                      xmlns="http://www.w3.org/TR/REC-html40">
-                <head>
-                <meta http-equiv="content-type" content="text/html; charset=UTF-8">
-                <!--[if gte mso 9]>
-                <xml>
-                <x:ExcelWorkbook>
-                <x:ExcelWorksheets>
-                <x:ExcelWorksheet>
-                <x:Name>Stok Kartı Hareketleri</x:Name>
-                <x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
-                </x:ExcelWorksheet>
-                </x:ExcelWorksheets>
-                </x:ExcelWorkbook>
-                </xml>
-                <![endif]-->
-                </head>
-                <body>
-                <h3>{secilen_stok_kart}</h3>
-                <p><b>Toplam Giriş:</b> {toplam_giris:,.2f} {birim} &nbsp; | &nbsp;
-                   <b>Toplam Çıkış:</b> {toplam_cikis:,.2f} {birim} &nbsp; | &nbsp;
-                   <b>Net Stok:</b> {net_stok:,.2f} {birim}</p>
-                {html_table}
-                </body>
-                </html>
-                """
-                return excel_html.encode("utf-8")
+            # Stok kartı hareketlerini ve parti bakiyelerini iki sayfalı gerçek Excel olarak indir.
+            # Bu rapor yalnızca bellekteki stok hareketlerini okur; SQL kayıtlarını değiştirmez.
+            def convert_stock_card_movements_to_excel():
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill, Alignment
+                from openpyxl.utils import get_column_letter
 
-            kart_excel_data = convert_stock_card_movements_to_excel(kart_gosterim)
-            guvenli_stok_kodu = secilen_stok_kodu.replace("/", "-").replace("\\", "-")
-            st.download_button(
-                label="📥 Seçili Stok Kartı Hareketlerini Excel'e Aktar (.xls)",
-                data=kart_excel_data,
-                file_name=f"stok_karti_hareketleri_{guvenli_stok_kodu}.xls",
-                mime="application/vnd.ms-excel",
-                key="stok_karti_hareket_excel"
-            )
+                raw = kart_hareketleri.copy().reset_index(drop=True)
+                raw["_kayit_sirasi"] = range(len(raw))
+                raw["_tarih_sirasi"] = pd.to_datetime(raw["Tarih"], errors="coerce", dayfirst=True)
+                # Tarih ve aynı gün için kaynak kayıt sırası kullanılır; işlem saati yoksa
+                # bu sıra gerçek fiziksel hareket sırasını kesin olarak göstermez.
+                raw = raw.sort_values(["_tarih_sirasi", "_kayit_sirasi"], kind="stable", na_position="last")
+                for col in ("Miktar", "BirimFiyat", "ToplamTutar"):
+                    raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0.0)
+                raw["Giriş"] = raw["Miktar"].where(raw["HareketTuru"] == "Giriş", 0.0)
+                raw["Çıkış"] = raw["Miktar"].where(raw["HareketTuru"] == "Çıkış", 0.0)
+                # Farklı depolardaki veya birimlerdeki aynı lotları birleştirme.
+                for key in ("Depo", "PartiNo", "Birim"):
+                    raw[key] = raw[key].fillna("").astype(str).str.strip()
+                group_keys = ["Depo", "PartiNo", "Birim"]
+                raw["Parti Kalan (Hareket Sonrası)"] = (raw["Giriş"] - raw["Çıkış"]).groupby(
+                    [raw[key] for key in group_keys], dropna=False).cumsum()
+                raw["İş Emri"] = raw["Tedarikci"].fillna("").astype(str).str.extract(r"^İş Emri:\s*(.*)$", expand=False).fillna("")
+
+                summary = raw.groupby(group_keys, dropna=False, sort=True).agg(
+                    **{"Toplam Giriş": ("Giriş", "sum"), "Toplam Çıkış": ("Çıkış", "sum")}
+                ).reset_index()
+                summary["Parti Kalan Stok"] = summary["Toplam Giriş"] - summary["Toplam Çıkış"]
+                workorders = raw[raw["İş Emri"].str.strip() != ""].groupby(group_keys, dropna=False)["İş Emri"].agg(
+                    lambda values: ", ".join(dict.fromkeys(str(x).strip() for x in values if str(x).strip()))
+                ).reset_index()
+                summary = summary.merge(workorders, on=group_keys, how="left")
+                summary["İş Emri"] = summary["İş Emri"].fillna("")
+
+                movement_columns = ["Tarih", "HareketTuru", "Depo", "PartiNo", "Giriş", "Çıkış",
+                                    "Parti Kalan (Hareket Sonrası)", "Miktar", "Birim", "Tedarikci", "Aciklama"]
+                if can_view_financial:
+                    movement_columns += ["BirimFiyat", "ToplamTutar"]
+                movement_labels = {"HareketTuru": "Hareket Türü", "PartiNo": "Parti / Lot No",
+                                   "Tedarikci": "Tedarikçi / İş Emri", "Aciklama": "Açıklama",
+                                   "BirimFiyat": "Birim Fiyat (TL)", "ToplamTutar": "Toplam Tutar (TL)"}
+                movement = raw[movement_columns].rename(columns=movement_labels)
+                summary = summary.rename(columns={"Depo": "Depo", "PartiNo": "Parti / Lot No",
+                                                  "Birim": "Birim", "İş Emri": "Kullanıldığı İş Emirleri"})
+
+                wb = Workbook()
+                ws1 = wb.active
+                ws1.title = "Stok Hareketleri"
+                ws2 = wb.create_sheet("Parti Bakiye Özeti")
+                ws1.append([secilen_stok_kart])
+                ws1.append([f"Toplam Giriş: {toplam_giris:,.2f} {birim} | Toplam Çıkış: {toplam_cikis:,.2f} {birim} | Net Stok: {net_stok:,.2f} {birim}"])
+                ws1.append(["Not: Aynı tarihte işlem saati yoksa hareket sırası kesin olmayabilir; nihai parti bakiyesi tüm hareketlerden hesaplanır."])
+                ws1.append([])
+                ws2.append([secilen_stok_kart + " — Parti Bakiye Özeti"])
+                ws2.append([])
+
+                for ws, frame, header_row in ((ws1, movement, 5), (ws2, summary, 3)):
+                    ws.append(list(frame.columns))
+                    for row in frame.itertuples(index=False, name=None):
+                        ws.append([v.item() if hasattr(v, "item") else (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v) for v in row])
+                    for cell in ws[header_row]:
+                        cell.font = Font(bold=True, color="FFFFFF")
+                        cell.fill = PatternFill("solid", fgColor="17365D")
+                        cell.alignment = Alignment(wrap_text=True)
+                    ws.freeze_panes = f"A{header_row+1}"
+                    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(frame.columns))}{ws.max_row}"
+                    for ci, name in enumerate(frame.columns, 1):
+                        ws.column_dimensions[get_column_letter(ci)].width = min(44, max(15, len(str(name)) + 4))
+                        if name in ("Giriş", "Çıkış", "Miktar", "Toplam Giriş", "Toplam Çıkış", "Parti Kalan Stok", "Parti Kalan (Hareket Sonrası)", "Birim Fiyat (TL)", "Toplam Tutar (TL)"):
+                            for row_i in range(header_row + 1, ws.max_row + 1):
+                                ws.cell(row_i, ci).number_format = '#,##0.00'
+                output = BytesIO()
+                wb.save(output)
+                return output.getvalue()
+
+            try:
+                kart_excel_data = convert_stock_card_movements_to_excel()
+                guvenli_stok_kodu = secilen_stok_kodu.replace("/", "-").replace("\\", "-")
+                st.download_button(
+                    label="📥 Seçili Stok Kartı Hareketlerini Excel'e Aktar (.xlsx)",
+                    data=kart_excel_data,
+                    file_name=f"stok_karti_hareketleri_{guvenli_stok_kodu}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="stok_karti_hareket_excel"
+                )
+            except ImportError:
+                st.error("Excel raporu için requirements.txt dosyasına openpyxl ekleyin.")
         else:
             st.info("Stok kartı hareketi bulunmuyor.")
 
