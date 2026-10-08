@@ -19,6 +19,7 @@ import json
 import urllib.request
 import urllib.parse
 import mimetypes
+import unicodedata
 
 st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
 
@@ -343,12 +344,24 @@ def _storage_request(method, storage_path, data=None, content_type=None):
         raise RuntimeError(f"Supabase Storage işlemi başarısız: {detail or exc}") from exc
 
 
+def _safe_storage_segment(value, default="dosya", max_length=80):
+    """Supabase Storage anahtarları için yalnızca güvenli ASCII karakterleri üret."""
+    value = str(value or "")
+    value = value.translate(str.maketrans({
+        "ı": "i", "İ": "I", "ğ": "g", "Ğ": "G", "ş": "s", "Ş": "S",
+        "ü": "u", "Ü": "U", "ö": "o", "Ö": "O", "ç": "c", "Ç": "C",
+    }))
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = ''.join(c if c.isascii() and (c.isalnum() or c in ('-', '_')) else '_' for c in value)
+    return value.strip('_')[:max_length] or default
+
+
 def _safe_storage_name(name):
-    raw = os.path.basename(str(name or "dosya"))
+    raw = str(name or "dosya").replace('\\', '/').rsplit('/', 1)[-1]
     stem, ext = os.path.splitext(raw)
-    safe_stem = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in stem).strip('_') or 'dosya'
-    safe_ext = ''.join(c for c in ext.lower() if c.isalnum() or c == '.')
-    return f"{safe_stem[:80]}{safe_ext[:12]}"
+    safe_stem = _safe_storage_segment(stem, "dosya", 80)
+    safe_ext = ''.join(c for c in ext.lower() if c.isascii() and (c.isalnum() or c == '.'))
+    return f"{safe_stem}{safe_ext[:12]}"
 
 
 def save_warehouse_receipt_file(parti_no, file_type, uploaded_file):
@@ -360,7 +373,7 @@ def save_warehouse_receipt_file(parti_no, file_type, uploaded_file):
         raise ValueError(f"{uploaded_file.name} dosyası 10 MB sınırını aşıyor.")
     safe_name = _safe_storage_name(uploaded_file.name)
     unique = secrets.token_hex(6)
-    storage_path = f"{str(parti_no).strip()}/{file_type}_{unique}_{safe_name}"
+    storage_path = f"{_safe_storage_segment(parti_no, default='parti')}/{_safe_storage_segment(file_type)}_{unique}_{safe_name}"
     mime_type = uploaded_file.type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     _storage_request("POST", storage_path, data=file_bytes, content_type=mime_type)
     try:
