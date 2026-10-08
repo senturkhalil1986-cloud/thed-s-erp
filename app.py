@@ -1676,50 +1676,69 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                         st.markdown("---")
                         st.subheader("2️⃣ Parti Bazlı Hammadde Sarfiyat Kalemleri Güncelleme")
 
+                        # Güncellenen iş emrinin eski tüketimleri kullanılabilir stoğa geri eklenir.
+                        # Böylece tamamen tüketilmiş lotlar da seçim alanında görünür.
                         giris_tx_ed = tx_df[tx_df["HareketTuru"] == "Giriş"].copy()
                         cikis_tx_ed = tx_df[tx_df["HareketTuru"] == "Çıkış"].copy()
-                        
                         parti_stoklari_ed = []
-                        for _, g_row in giris_tx_ed.iterrows():
-                            s_kod = g_row["StokKodu"]
-                            p_no = str(g_row["PartiNo"]).strip()
-                            d_adi = g_row["Depo"]
-                            cikan_mik = 0.0
-                            if not cikis_tx_ed.empty:
-                                cikan_mik = cikis_tx_ed[(cikis_tx_ed["StokKodu"] == s_kod) & (cikis_tx_ed["PartiNo"].astype(str).str.strip() == p_no)]["Miktar"].sum()
-                            kalan_mik = g_row["Miktar"] - cikan_mik
-                            if kalan_mik > 0:
+                        for (s_kod, p_no, d_adi), giris_grup in giris_tx_ed.groupby(
+                            ["StokKodu", "PartiNo", "Depo"], dropna=False, sort=False
+                        ):
+                            p_no = str(p_no).strip()
+                            ilgili_cikislar = cikis_tx_ed[
+                                (cikis_tx_ed["StokKodu"] == s_kod)
+                                & (cikis_tx_ed["PartiNo"].astype(str).str.strip() == p_no)
+                                & (cikis_tx_ed["Depo"] == d_adi)
+                            ]
+                            eski_is_emri_cikis = ilgili_cikislar[
+                                ilgili_cikislar.index.isin(mevcut_sarfiyatlar.index)
+                            ]
+                            kalan_mik = (float(giris_grup["Miktar"].sum())
+                                         - float(ilgili_cikislar["Miktar"].sum())
+                                         + float(eski_is_emri_cikis["Miktar"].sum()))
+                            if kalan_mik > 0 or not eski_is_emri_cikis.empty:
+                                g_row = giris_grup.iloc[0]
                                 parti_stoklari_ed.append({
                                     "StokKodu": s_kod,
                                     "StokAdi": g_row["StokAdi"],
                                     "Depo": d_adi,
                                     "Birim": g_row["Birim"],
                                     "PartiNo": p_no,
-                                    "BirimFiyat": g_row["BirimFiyat"],
+                                    "BirimFiyat": float(g_row["BirimFiyat"]),
                                     "KalanMiktar": kalan_mik,
-                                    "Etiket": (f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {g_row['BirimFiyat']:,.2f} TL | Kalan: {kalan_mik:,.2f} {g_row['Birim']}" if can_view_financial else f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Kalan: {kalan_mik:,.2f} {g_row['Birim']}")
+                                    "Etiket": (f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Fiyat: {float(g_row['BirimFiyat']):,.2f} TL | Kullanılabilir: {kalan_mik:,.2f} {g_row['Birim']}" if can_view_financial else f"{s_kod} - {g_row['StokAdi']} [Depo: {d_adi}] | Parti/Lot: {p_no} | Kullanılabilir: {kalan_mik:,.2f} {g_row['Birim']}")
                                 })
                         df_aktif_partiler_ed = pd.DataFrame(parti_stoklari_ed)
                         aktif_parti_secenekleri_ed = df_aktif_partiler_ed["Etiket"].tolist() if not df_aktif_partiler_ed.empty else []
 
                         edit_sarf_secimleri = []
                         satir_sayisi_edit = max(4, len(mevcut_sarfiyatlar) + 2)
-                        
                         for i in range(satir_sayisi_edit):
                             default_mat = "Seçiniz..."
                             default_val = 0.0
                             if i < len(mevcut_sarfiyatlar):
                                 row_s = mevcut_sarfiyatlar.iloc[i]
-                                matched_et = [et for et in aktif_parti_secenekleri_ed if f"{row_s['StokKodu']}" in et and f"{row_s['PartiNo']}" in et]
-                                if matched_et:
-                                    default_mat = matched_et[0]
+                                eslesen = df_aktif_partiler_ed[
+                                    (df_aktif_partiler_ed["StokKodu"] == row_s["StokKodu"])
+                                    & (df_aktif_partiler_ed["PartiNo"] == str(row_s["PartiNo"]).strip())
+                                    & (df_aktif_partiler_ed["Depo"] == row_s["Depo"])
+                                ] if not df_aktif_partiler_ed.empty else pd.DataFrame()
+                                if not eslesen.empty:
+                                    default_mat = eslesen.iloc[0]["Etiket"]
                                 default_val = float(row_s["Miktar"])
-
                             rc1, rc2 = st.columns([3, 1])
                             with rc1:
-                                m_sec_ed = st.selectbox(f"Sarf Malzemesi {i+1}", ["Seçiniz..."] + aktif_parti_secenekleri_ed, index=aktif_parti_secenekleri_ed.index(default_mat)+1 if default_mat in aktif_parti_secenekleri_ed else 0, key=f"edit_mat_{secilen_is_emri}_{i}")
+                                secenekler = ["Seçiniz..."] + aktif_parti_secenekleri_ed
+                                m_sec_ed = st.selectbox(
+                                    f"Sarf Malzemesi {i+1}", secenekler,
+                                    index=secenekler.index(default_mat) if default_mat in secenekler else 0,
+                                    key=f"edit_mat_v2_{secilen_is_emri}_{i}",
+                                )
                             with rc2:
-                                m_amt_ed = st.number_input(f"Miktar {i+1}", min_value=0.0, value=default_val, step=1.0, format="%.2f", key=f"edit_amt_{secilen_is_emri}_{i}")
+                                m_amt_ed = st.number_input(
+                                    f"Miktar {i+1}", min_value=0.0, value=default_val,
+                                    step=1.0, format="%.2f", key=f"edit_amt_v2_{secilen_is_emri}_{i}",
+                                )
                             edit_sarf_secimleri.append((m_sec_ed, m_amt_ed))
 
                         st.markdown("---")
@@ -1790,6 +1809,8 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
 
                             if yeni_uretim_miktari <= 0:
                                 st.error("Üretilen miktar sıfırdan büyük olmalıdır!")
+                            elif any(m == "Seçiniz..." and a > 0 for m, a in edit_sarf_secimleri):
+                                st.error("Miktarı girilmiş sarf satırında malzeme/parti seçimi boş olamaz. Kayıt yapılmadı.")
                             elif not secilen_yeni_recete:
                                 st.error("En az bir adet hammadde sarfiyatı seçilmelidir!")
                             else:
@@ -1800,7 +1821,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                 mask_mamul_eski = (tx_df["PartiNo"].astype(str) == str(secilen_is_emri)) & (tx_df["Tedarikci"] == "Dahili Üretim")
                                 mask_sarf_eski = tx_df["Tedarikci"].astype(str).str.contains(str(secilen_is_emri))
                                 mask_fire_eski = tx_df["PartiNo"].astype(str) == f"{secilen_is_emri}-FIRE"
-                                tx_df = tx_df[~(mask_mamul_eski | mask_sarf_eski | mask_fire_eski)]
+                                tx_df_yeni = tx_df[~(mask_mamul_eski | mask_sarf_eski | mask_fire_eski)].copy()
 
                                 yeni_eklenen_hareketler = []
                                 toplam_sarfiyat_maliyeti = 0.0
@@ -1894,7 +1915,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     }
                                     yeni_eklenen_hareketler.append(mamul_giris)
 
-                                    tx_df = pd.concat([tx_df, pd.DataFrame(yeni_eklenen_hareketler)], ignore_index=True)
+                                    tx_df = pd.concat([tx_df_yeni, pd.DataFrame(yeni_eklenen_hareketler)], ignore_index=True)
                                     save_data(tx_df, STOCK_TRANSACTIONS_FILE)
 
                                     final_photo_path = mevcut_foto
