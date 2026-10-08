@@ -1388,19 +1388,24 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                     st.session_state.fire_satir_sayisi = 2
                     st.rerun()
 
+            # Mamül seçimi formun dışında tutulur: seçim değiştiği anda tam ürün adı
+            # ekranda yenilenir. Böylece dar ekran/tablette kesilen RTE vb. bilgiler okunur.
+            mamul_master_df = master_df[master_df["Depo"] == "Mamül Deposu"]
+            if mamul_master_df.empty:
+                mamul_options = ["Mamül Deposunda Ürün Yok"]
+            else:
+                mamul_options = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
+            secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options, key="uretim_mamul_secimi")
+            if secilen_mamul_str != "Mamül Deposunda Ürün Yok":
+                secilen_mamul_kodu, _, secilen_mamul_adi = secilen_mamul_str.partition(" - ")
+                st.markdown("**Seçilen mamulün tam bilgisi (kontrol edin):**")
+                st.info(f"**Stok Kodu:** {secilen_mamul_kodu}\n\n**Ürün Adı / Özellikleri:** {secilen_mamul_adi}")
+
             with st.form("production_form"):
                 st.subheader("1️⃣ Üretilecek Mamül and Fotoğraf Bilgisi")
-                c1, c2, c3 = st.columns(3)
+                c1, c3 = st.columns(2)
                 with c1:
                     uretim_tarihi = st.date_input("Üretim Tarihi", datetime.now())
-                with c2:
-                    mamul_master_df = master_df[master_df["Depo"] == "Mamül Deposu"]
-                    if mamul_master_df.empty:
-                        mamul_options = ["Mamül Deposunda Ürün Yok"]
-                    else:
-                        mamul_options = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
-                    
-                    secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options)
                 with c3:
                     uretilen_miktar = st.number_input("Üretilen Mamül Miktarı", min_value=0.01, step=1.0, format="%.2f")
 
