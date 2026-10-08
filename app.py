@@ -1313,7 +1313,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                     st.session_state.fire_satir_sayisi = 2
                     st.rerun()
 
-            with st.form("production_form"):
+            with st.container():  # Form yerine canli guncellenen widgetlar
                 st.subheader("1️⃣ Üretilecek Mamül and Fotoğraf Bilgisi")
                 c1, c2, c3 = st.columns(3)
                 with c1:
@@ -1407,7 +1407,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
 
                 aciklama = st.text_area("Üretim Notları / Açıklama")
 
-                submitted = st.form_submit_button("Üretimi ve Sarfiyatı Onayla" if not can_view_financial else "Üretimi, Sarfiyatı, Fireyi and Maliyeti Onayla")
+                submitted = st.button("Üretimi ve Sarfiyatı Onayla" if not can_view_financial else "Üretimi, Sarfiyatı, Fireyi and Maliyeti Onayla", key="production_confirm_button")
                 
                 if submitted:
                     secilen_recete = [(m, a) for m, a in recete_secimleri if m != "Seçiniz..." and a > 0]
