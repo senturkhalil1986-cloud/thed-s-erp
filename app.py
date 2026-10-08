@@ -688,6 +688,42 @@ ROLE_MODULES = {
 }
 current_role = st.session_state.get("role", "personel")
 # Finansal bilgiler yalnızca yönetici ve admin rollerinde görünür.
+
+
+def build_lot_balance_report(transactions):
+    """Read-only lot ledger; scope by stock code, warehouse, lot and unit."""
+    columns = ["StokKodu", "StokAdi", "Depo", "PartiNo", "Birim", "Giriş", "Çıkış", "Kalan"]
+    if transactions.empty:
+        return pd.DataFrame(columns=columns)
+    df = transactions.copy()
+    for field in ["StokKodu", "StokAdi", "Depo", "PartiNo", "Birim"]:
+        df[field] = df[field].fillna("").astype(str).str.strip()
+    df["Miktar"] = pd.to_numeric(df["Miktar"], errors="coerce").fillna(0.0)
+    df["Giriş"] = df["Miktar"].where(df["HareketTuru"] == "Giriş", 0.0)
+    df["Çıkış"] = df["Miktar"].where(df["HareketTuru"] == "Çıkış", 0.0)
+    keys = ["StokKodu", "StokAdi", "Depo", "PartiNo", "Birim"]
+    result = df.groupby(keys, dropna=False, as_index=False)[["Giriş", "Çıkış"]].sum()
+    result["Kalan"] = result["Giriş"] - result["Çıkış"]
+    return result[columns].sort_values(["StokKodu", "Depo", "PartiNo"])
+
+
+def lot_usage_report(transactions, stock_code, warehouse, lot, unit):
+    """Return all movements for one physical lot and per-work-order consumption."""
+    df = transactions.copy()
+    for field in ["StokKodu", "Depo", "PartiNo", "Birim"]:
+        df[field] = df[field].fillna("").astype(str).str.strip()
+    subset = df[(df["StokKodu"] == stock_code) & (df["Depo"] == warehouse)
+                & (df["PartiNo"] == lot) & (df["Birim"] == unit)].copy()
+    subset["Miktar"] = pd.to_numeric(subset["Miktar"], errors="coerce").fillna(0.0)
+    subset["Giriş"] = subset["Miktar"].where(subset["HareketTuru"] == "Giriş", 0.0)
+    subset["Çıkış"] = subset["Miktar"].where(subset["HareketTuru"] == "Çıkış", 0.0)
+    subset["Bakiye"] = (subset["Giriş"] - subset["Çıkış"]).cumsum()
+    usage = subset[(subset["HareketTuru"] == "Çıkış") & subset["Tedarikci"].fillna("").astype(str).str.startswith("İş Emri:")].copy()
+    usage["İş Emri"] = usage["Tedarikci"].astype(str).str.replace(r"^İş Emri:\s*", "", regex=True).str.strip()
+    summary = usage.groupby("İş Emri", as_index=False)["Miktar"].sum().rename(columns={"Miktar": "Toplam Sarf"})
+    return subset, usage, summary
+
+
 can_view_financial = current_role in ("admin", "yonetici")
 menu = ROLE_MODULES.get(current_role, ALL_MENU[1:])
 if not menu:
@@ -2423,7 +2459,7 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
 # --- 7. İZLENEBİLİRLİK & İŞLEM GEÇMİŞİ ---
 elif choice == "7. İzlenebilirlik & İşlem Geçmişi":
     st.header("🔎 Lot İzlenebilirliği & İşlem Geçmişi")
-    tab_trace, tab_audit = st.tabs(["🔗 Lot / Üretim / Sevkiyat Zinciri", "🧾 Kullanıcı İşlem Geçmişi"])
+    tab_trace, tab_lot, tab_audit = st.tabs(["🔗 Lot / Üretim / Sevkiyat Zinciri", "📦 Parti Bakiye & Kullanım", "🧾 Kullanıcı İşlem Geçmişi"])
 
     with tab_trace:
         tx_trace = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
@@ -2502,6 +2538,51 @@ elif choice == "7. İzlenebilirlik & İşlem Geçmişi":
                 st.warning("Bu numarayla eşleşen lot, iş emri veya irsaliye bulunamadı.")
         else:
             st.info("Bir lot, iş emri veya irsaliye numarası girerek uçtan uca izlenebilirliği görüntüleyebilirsin.")
+
+
+    with tab_lot:
+        st.subheader("📦 Parti Bazlı Stok ve Üretim Kullanım Geçmişi")
+        st.caption("Hesaplar stok kodu + depo + parti + birim bazındadır. Aynı lot kodunun farklı ürünlerde kullanılması kayıtları karıştırmaz.")
+        lot_tx = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
+        lot_balances = build_lot_balance_report(lot_tx)
+        if lot_balances.empty:
+            st.info("Henüz parti bazlı stok hareketi yok.")
+        else:
+            search_lot = st.text_input("Parti / lot veya stok kodu ara", key="lot_balance_search").strip().casefold()
+            filtered = lot_balances.copy()
+            if search_lot:
+                filtered = filtered[filtered["PartiNo"].str.casefold().str.contains(search_lot, regex=False) | filtered["StokKodu"].str.casefold().str.contains(search_lot, regex=False)]
+            st.dataframe(filtered.rename(columns={"Giriş": "Toplam Giriş", "Çıkış": "Toplam Çıkış", "Kalan": "Parti Kalan Stok"}), use_container_width=True, hide_index=True)
+            if not filtered.empty:
+                lot_options = filtered.reset_index(drop=True)
+                idx = st.selectbox("İncelenecek stok / depo / parti", range(len(lot_options)),
+                    format_func=lambda i: f"{lot_options.iloc[i]['StokKodu']} | {lot_options.iloc[i]['Depo']} | {lot_options.iloc[i]['PartiNo']} | {lot_options.iloc[i]['Kalan']:,.2f} {lot_options.iloc[i]['Birim']}", key="trace_lot_select")
+                item = lot_options.iloc[idx]
+                movements, usage, work_orders = lot_usage_report(lot_tx, item["StokKodu"], item["Depo"], item["PartiNo"], item["Birim"])
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Parti Girişi", f"{item['Giriş']:,.2f} {item['Birim']}")
+                m2.metric("Parti Çıkışı", f"{item['Çıkış']:,.2f} {item['Birim']}")
+                m3.metric("Parti Kalanı", f"{item['Kalan']:,.2f} {item['Birim']}")
+                if item["Kalan"] < -0.00001:
+                    st.error("⚠️ Bu parti için negatif bakiye tespit edildi; kayıtları kontrol edin.")
+                st.markdown("**Üretimlerde kullanım (iş emri bazında)**")
+                if work_orders.empty:
+                    st.info("Bu partiden iş emrine bağlı üretim sarfı bulunamadı.")
+                else:
+                    st.dataframe(work_orders, use_container_width=True, hide_index=True)
+                st.markdown("**Partinin bütün giriş / çıkış hareketleri**")
+                shown = ["Tarih", "HareketTuru", "StokKodu", "Depo", "PartiNo", "Giriş", "Çıkış", "Bakiye", "Birim", "Tedarikci", "Aciklama"]
+                st.dataframe(movements[shown], use_container_width=True, hide_index=True)
+                if not movements.empty:
+                    st.caption("Hareket bakiyesi kayıt sırasına göredir; aynı gün içinde saat bilgisi bulunmuyorsa gerçek işlem sırası farklı olabilir.")
+                # Mevcut ERP'nin Excel uyumlu HTML aktarım yöntemi; maliyet verileri bu raporda bulunmaz.
+                export_sections = [("Parti Özeti", filtered), ("İş Emri Kullanımı", work_orders), ("Parti Hareketleri", movements[shown])]
+                html = '<html><head><meta charset="utf-8"></head><body>' + ''.join(
+                    '<h3>' + title + '</h3>' + frame.to_html(index=False, escape=True) for title, frame in export_sections) + '</body></html>'
+                st.download_button("📥 Parti İzlenebilirlik Raporunu Excel'e Aktar (.xls)",
+                    data=html.encode("utf-8-sig"), file_name="parti_izlenebilirlik.xls",
+                    mime="application/vnd.ms-excel", key="download_lot_trace")
+                st.caption("İleri/geri izlenebilirlik için yan sekmedeki Lot / Üretim / Sevkiyat Zinciri aramasını kullanabilirsiniz.")
 
     with tab_audit:
         audit_df = load_audit_log(2000)
