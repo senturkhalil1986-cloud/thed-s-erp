@@ -8,7 +8,7 @@ from io import BytesIO
 # --- GÜVENLİ GİRİŞ / KULLANICI YÖNETİMİ ---
 import psycopg2
 from psycopg2 import sql
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 import hashlib
 import hmac
 import secrets
@@ -231,21 +231,27 @@ def _table_for_file(filepath):
         raise ValueError(f"Bilinmeyen veri kaynağı: {filepath}")
     return table
 
+@st.cache_data(ttl=4, max_entries=24, show_spinner=False)
+def _load_table_cached(table, column_tuple):
+    """Kisa sureli okuma onbellegi; her cagriya bagimsiz DataFrame kopyasi doner."""
+    query = sql.SQL("SELECT {} FROM public.{} ORDER BY created_at, ctid").format(
+        sql.SQL(', ').join(sql.Identifier(c) for c in column_tuple),
+        sql.Identifier(table),
+    )
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=list(column_tuple))
+
+
 def load_data(filepath, columns):
     """ERP verisini CSV yerine Supabase PostgreSQL'den okur."""
     table = _table_for_file(filepath)
     if not columns:
         return pd.DataFrame()
-    query = sql.SQL("SELECT {} FROM public.{} ORDER BY created_at, ctid").format(
-        sql.SQL(', ').join(sql.Identifier(c) for c in columns),
-        sql.Identifier(table),
-    )
     try:
-        with pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                rows = cur.fetchall()
-        df = pd.DataFrame(rows, columns=columns)
+        df = _load_table_cached(table, tuple(columns))
 
         # PostgreSQL NUMERIC alanlari psycopg2 tarafindan Decimal olarak gelebilir.
         # ERP hesaplarinda Decimal/float karisikligi TypeError olusturmasin diye
@@ -587,8 +593,20 @@ def save_data(df, filepath):
                             sql.SQL(', ').join(sql.Identifier(c) for c in columns),
                             sql.SQL(', ').join(sql.Placeholder() for _ in columns),
                         )
+                        # Satirlari tek tek gondermek yerine partiler halinde gonder.
+                        # DELETE + INSERT ayni transaction icinde kalir.
+                        insert_sql = insert_q.as_string(conn)
+                        insert_sql = insert_sql[:insert_sql.rfind(" VALUES (")] + " VALUES %s"
+                        values_sql = "(" + ",".join(["%s"] * len(columns)) + ")"
+                        batch = []
                         for row in df.itertuples(index=False, name=None):
-                            cur.execute(insert_q, tuple(_pg_value(v) for v in row))
+                            batch.append(tuple(_pg_value(v) for v in row))
+                            if len(batch) >= 500:
+                                execute_values(cur, insert_sql, batch, template=values_sql, page_size=500)
+                                batch.clear()
+                        if batch:
+                            execute_values(cur, insert_sql, batch, template=values_sql, page_size=500)
+            _load_table_cached.clear()
             logging.info("DB_SAVE user=%s table=%s rows=%s", st.session_state.get("username","system"), table, len(df))
         except Exception as exc:
             logging.exception("DB_SAVE_ERROR table=%s", table)
@@ -1391,7 +1409,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                         ek_giderler = st.number_input("Ek Enerji / Diğer Giderler (TL)", min_value=0.0, step=50.0, value=0.0, format="%.2f")
                     with ec6:
                         toplam_iscilik_gideri = hesaplanan_iscilik_maliyeti + ek_giderler
-                        st.markdown(f"**💰 Toplam Personel and Ek Gider:** `{toplam_iscilik_gideri:,.2f} TL`")
+                        st.markdown(f"**💰 Toplam Personel ve Ek Gider:** `{toplam_iscilik_gideri:,.2f} TL`")
                 else:
                     ec1, ec2, ec3 = st.columns(3)
                     with ec1:
