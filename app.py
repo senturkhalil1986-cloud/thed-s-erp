@@ -231,7 +231,7 @@ def _table_for_file(filepath):
         raise ValueError(f"Bilinmeyen veri kaynağı: {filepath}")
     return table
 
-@st.cache_data(ttl=4, max_entries=24, show_spinner=False)
+@st.cache_data(ttl=30, max_entries=24, show_spinner=False)
 def _load_table_cached(table, column_tuple):
     """Kisa sureli okuma onbellegi; her cagriya bagimsiz DataFrame kopyasi doner."""
     query = sql.SQL("SELECT {} FROM public.{} ORDER BY created_at, ctid").format(
@@ -882,21 +882,24 @@ if st.session_state.get("role") == "admin":
             )
             st.dataframe(recovery_df, use_container_width=True, hide_index=True)
 
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for full_path, _ in recovery_files:
-                    try:
-                        zf.write(full_path, arcname=os.path.relpath(full_path, DB_DIR))
-                    except OSError:
-                        pass
-            zip_buffer.seek(0)
-            st.download_button(
-                "⬇️ DATA KLASÖRÜNÜ ZIP OLARAK İNDİR",
-                data=zip_buffer.getvalue(),
-                file_name=f"erp_data_recovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+            # ZIP sadece kullanici talep edince hazirlanir; her Streamlit rerun'inda
+            # butun klasoru tekrar sikistirmak uygulamayi ciddi yavaslatir.
+            if st.button("📦 Yedek ZIP dosyasını hazırla", key="prepare_recovery_zip"):
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for full_path, _ in recovery_files:
+                        try:
+                            zf.write(full_path, arcname=os.path.relpath(full_path, DB_DIR))
+                        except OSError:
+                            pass
+                st.session_state["recovery_zip_bytes"] = zip_buffer.getvalue()
+            if st.session_state.get("recovery_zip_bytes"):
+                st.download_button(
+                    "⬇️ DATA KLASÖRÜNÜ ZIP OLARAK İNDİR",
+                    data=st.session_state["recovery_zip_bytes"],
+                    file_name=f"erp_data_recovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip", use_container_width=True,
+                )
         else:
             st.error("data klasörü bulunamadı.")
 
@@ -1386,15 +1389,21 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
         giris_transactions = tx_df[tx_df["HareketTuru"] == "Giriş"].copy()
         cikis_transactions = tx_df[tx_df["HareketTuru"] == "Çıkış"].copy()
         
+        # Tek seferlik lot toplami: her giris satirinda tum cikislari tarama.
+        cikis_lot_toplam = {}
+        if not cikis_transactions.empty:
+            cikis_lot_toplam = (
+                cikis_transactions.assign(_parti_norm=cikis_transactions["PartiNo"].astype(str).str.strip())
+                .groupby(["StokKodu", "_parti_norm"], dropna=False)["Miktar"]
+                .sum().to_dict()
+            )
         parti_stoklari = []
         for _, g_row in giris_transactions.iterrows():
             s_kod = g_row["StokKodu"]
             p_no = str(g_row["PartiNo"]).strip()
             d_adi = g_row["Depo"]
             
-            cikan_mik = 0.0
-            if not cikis_transactions.empty:
-                cikan_mik = cikis_transactions[(cikis_transactions["StokKodu"] == s_kod) & (cikis_transactions["PartiNo"].astype(str).str.strip() == p_no)]["Miktar"].sum()
+            cikan_mik = cikis_lot_toplam.get((s_kod, p_no), 0.0)
             
             kalan_mik = g_row["Miktar"] - cikan_mik
             if kalan_mik > 0:
@@ -2201,15 +2210,21 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
         giris_txs = tx_df[tx_df["HareketTuru"] == "Giriş"].copy()
         cikis_txs = tx_df[tx_df["HareketTuru"] == "Çıkış"].copy()
         
+        # Tek seferlik lot toplami: her giris satirinda tum cikislari tarama.
+        cikis_lot_toplam = {}
+        if not cikis_txs.empty:
+            cikis_lot_toplam = (
+                cikis_txs.assign(_parti_norm=cikis_txs["PartiNo"].astype(str).str.strip())
+                .groupby(["StokKodu", "_parti_norm"], dropna=False)["Miktar"]
+                .sum().to_dict()
+            )
         mamul_partileri = []
         for _, g_row in giris_txs.iterrows():
             if g_row["Depo"] == "Mamül Deposu":
                 s_kod = g_row["StokKodu"]
                 p_no = str(g_row["PartiNo"]).strip()
                 
-                cikan_mik = 0.0
-                if not cikis_txs.empty:
-                    cikan_mik = cikis_txs[(cikis_txs["StokKodu"] == s_kod) & (cikis_txs["PartiNo"].astype(str).str.strip() == p_no)]["Miktar"].sum()
+                cikan_mik = cikis_lot_toplam.get((s_kod, p_no), 0.0)
                 
                 kalan_mik = g_row["Miktar"] - cikan_mik
                 if kalan_mik > 0:
