@@ -1085,11 +1085,11 @@ elif choice == "1. Stok Kartı Tanımlama":
     if master_df.empty:
         st.info("Henüz sistemde hiç stok kartı yok.")
     else:
-        st.dataframe(master_df, use_container_width=True)
+        st.dataframe(master_df.drop(columns=["StokKodu"], errors="ignore"), use_container_width=True)
         
         st.markdown("### 🗑️ Yanlış Girilen Stok Kartını Sil")
         stok_secenekleri = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in master_df.iterrows()]
-        secilen_stok_sil = st.selectbox("Silmek İstediğin Stok Kartını Seç", ["Seçiniz..."] + stok_secenekleri)
+        secilen_stok_sil = st.selectbox("Silmek İstediğin Stok Kartını Seç", ["Seçiniz..."] + stok_secenekleri, format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
         if st.button("Seçilen Stok Kartını Sil"):
             if secilen_stok_sil != "Seçiniz...":
                 silinecek_kod = secilen_stok_sil.split(" - ")[0].strip()
@@ -1208,7 +1208,7 @@ elif choice == "2. Depo / Malzeme Girişi":
             "BirimFiyat": "{:,.2f} TL",
             "ToplamTutar": "{:,.2f} TL"
         }, na_rep="")
-        st.dataframe(styled_giris, use_container_width=True)
+        st.dataframe(giris_df.drop(columns=["StokKodu"], errors="ignore").style.format({"Miktar":"{:,.2f}", "BirimFiyat":"{:,.2f} TL", "ToplamTutar":"{:,.2f} TL"}, na_rep=""), use_container_width=True)
 
         with st.expander("📎 Mal Kabul Fotoğrafı / İrsaliye Arşivi"):
             arsiv_partiler = giris_df["PartiNo"].dropna().astype(str).str.strip().tolist()
@@ -1313,7 +1313,7 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                 else:
                     urun_opts = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
                 
-                secilen_stok_str = st.selectbox("İlgili Mamül Stok Seçimi", urun_opts if urun_opts else ["Mamül Bulunamadı"])
+                secilen_stok_str = st.selectbox("İlgili Mamül Stok Seçimi", urun_opts if urun_opts else ["Mamül Bulunamadı"], format_func=lambda x: x.split(" - ", 1)[-1])
                 
                 spek_adi = st.text_input("Spek Başlığı / Belge Adı (Örn: Müşteri Teknik Spek Dokümanı v1)")
                 spek_detayi = st.text_area("Spek Detay / Özel İstekler (Örn: 28-30°Bx, 5kg Teneke Kutu, Laklı Kapak)")
@@ -1364,7 +1364,7 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                 st.info("Henüz girilmiş özel spek bulunmuyor.")
             else:
                 spek_secenekleri = [f"Firma: {row['CariAdi']} | Ürün: {row['StokKodu']} | Spek: {row['SpekAdi']}" for _, row in df_speks.iterrows()]
-                secilen_spek_sil = st.selectbox("Silmek İstediğin Spek Kaydını Seç", ["Seçiniz..."] + spek_secenekleri)
+                secilen_spek_sil = st.selectbox("Silmek İstediğin Spek Kaydını Seç", ["Seçiniz..."] + spek_secenekleri, format_func=lambda x: x.split(" | Ürün: ", 1)[0] + " | " + x.rsplit(" | ", 1)[-1] if " | Ürün: " in x else x)
                 if st.button("Seçilen Spek Kaydını Sil"):
                     if secilen_spek_sil != "Seçiniz...":
                         f_adi = secilen_spek_sil.split("Firma: ")[1].split(" | ")[0].strip()
@@ -1378,11 +1378,10 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
 
                 st.markdown("---")
                 for idx, row in df_speks.iterrows():
-                    with st.expander(f"Firma: {row['CariAdi']} | Ürün Kodu: {row['StokKodu']} | Spek: {row['SpekAdi']}"):
+                    with st.expander(f"Firma: {row['CariAdi']} | Spek: {row['SpekAdi']}"):
                         col_d1, col_d2, col_d3 = st.columns([2, 1, 1])
                         with col_d1:
                             st.markdown(f"**Cari Firma:** {row['CariAdi']}")
-                            st.markdown(f"**Stok Kodu:** {row['StokKodu']}")
                             st.markdown(f"**Spek Başlığı:** {row['SpekAdi']}")
                             st.markdown(f"**Detaylar:** {row['SpekDetayi']}")
                             
@@ -1494,7 +1493,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                     mamul_options = ["Mamül Deposunda Ürün Yok"]
                 else:
                     mamul_options = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
-                secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options)
+                secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options, format_func=lambda x: x.split(" - ", 1)[-1])
 
                 uploaded_photo = st.file_uploader("📸 Üretilen Ürüne Ait Fotoğraf / Kalite Kontrol Görseli Yükle", type=["png", "jpg", "jpeg"])
 
@@ -1507,7 +1506,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                 for i in range(st.session_state.recete_satir_sayisi):
                     rc1, rc2 = st.columns([3, 1])
                     with rc1:
-                        m_sec = st.selectbox(f"{i+1}. Sarf Malzemesi (Parti Bazlı)", ["Seçiniz..."] + aktif_parti_secenekleri, key=f"mat_{i}")
+                        m_sec = st.selectbox(f"{i+1}. Sarf Malzemesi (Parti Bazlı)", ["Seçiniz..."] + aktif_parti_secenekleri, key=f"mat_{i}", format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
                     with rc2:
                         m_amt = st.number_input(f"Miktar {i+1}", min_value=0.0, step=1.0, format="%.2f", key=f"amt_{i}")
                     recete_secimleri.append((m_sec, m_amt))
@@ -1521,7 +1520,7 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                 for j in range(st.session_state.fire_satir_sayisi):
                     fc1, fc2, fc3 = st.columns([3, 1, 1])
                     with fc1:
-                        f_sec = st.selectbox(f"{j+1}. Fire / 2. Kalite Ürün", ["Seçiniz..."] + master_item_options, key=f"fire_mat_{j}")
+                        f_sec = st.selectbox(f"{j+1}. Fire / 2. Kalite Ürün", ["Seçiniz..."] + master_item_options, key=f"fire_mat_{j}", format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
                     with fc2:
                         f_amt = st.number_input(f"Fire Miktar {j+1}", min_value=0.0, step=1.0, format="%.2f", key=f"fire_amt_{j}")
                     with fc3:
@@ -1837,7 +1836,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
 
                             rc1, rc2 = st.columns([3, 1])
                             with rc1:
-                                m_sec_ed = st.selectbox(f"Sarf Malzemesi {i+1}", ["Seçiniz..."] + aktif_parti_secenekleri_ed, index=aktif_parti_secenekleri_ed.index(default_mat)+1 if default_mat in aktif_parti_secenekleri_ed else 0, key=f"edit_mat_{secilen_is_emri}_{i}")
+                                m_sec_ed = st.selectbox(f"Sarf Malzemesi {i+1}", ["Seçiniz..."] + aktif_parti_secenekleri_ed, index=aktif_parti_secenekleri_ed.index(default_mat)+1 if default_mat in aktif_parti_secenekleri_ed else 0, key=f"edit_mat_{secilen_is_emri}_{i}", format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
                             with rc2:
                                 m_amt_ed = st.number_input(f"Miktar {i+1}", min_value=0.0, value=default_val, step=1.0, format="%.2f", key=f"edit_amt_{secilen_is_emri}_{i}")
                             edit_sarf_secimleri.append((m_sec_ed, m_amt_ed))
@@ -1862,7 +1861,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
 
                             fc1, fc2, fc3 = st.columns([3, 1, 1])
                             with fc1:
-                                f_sec_ed = st.selectbox(f"Fire / 2. Kalite {j+1}", ["Seçiniz..."] + stok_options_edit, index=stok_options_edit.index(def_f_mat)+1 if def_f_mat in stok_options_edit else 0, key=f"edit_fire_mat_{secilen_is_emri}_{j}")
+                                f_sec_ed = st.selectbox(f"Fire / 2. Kalite {j+1}", ["Seçiniz..."] + stok_options_edit, index=stok_options_edit.index(def_f_mat)+1 if def_f_mat in stok_options_edit else 0, key=f"edit_fire_mat_{secilen_is_emri}_{j}", format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
                             with fc2:
                                 f_amt_ed = st.number_input(f"Fire Miktar {j+1}", min_value=0.0, value=def_f_mik, step=1.0, format="%.2f", key=f"edit_fire_amt_{secilen_is_emri}_{j}")
                             with fc3:
@@ -2108,7 +2107,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 "Toplam Çıkış": "{:,.2f}",
                 "Net Kalan": "{:,.2f}"
             })
-            st.dataframe(styled_summary, use_container_width=True)
+            st.dataframe(summary_df.drop(columns=["Stok Kodu"], errors="ignore").style.format({"Toplam Giriş":"{:,.2f}", "Toplam Çıkış":"{:,.2f}", "Net Kalan":"{:,.2f}"}), use_container_width=True)
             
             def convert_df_to_excel(df):
                 html_table = df.to_html(index=False, escape=False)
@@ -2156,7 +2155,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                          .sort_values(["StokKodu", "StokAdi"]))
         stok_kart_secenekleri = [f"{r['StokKodu']} - {r['StokAdi']}" for _, r in stok_kartlari.iterrows()]
         if stok_kart_secenekleri:
-            secilen_stok_kart = st.selectbox("Stok Kartı Seç", stok_kart_secenekleri, key="stok_karti_hareket_sec")
+            secilen_stok_kart = st.selectbox("Stok Kartı Seç", stok_kart_secenekleri, key="stok_karti_hareket_sec", format_func=lambda x: x.split(" - ", 1)[-1])
             secilen_stok_kodu = secilen_stok_kart.split(" - ", 1)[0].strip()
             kart_hareketleri = tx_df[tx_df["StokKodu"].astype(str) == secilen_stok_kodu].copy()
             kart_hareketleri["Giriş Miktarı"] = kart_hareketleri.apply(lambda r: r["Miktar"] if r["HareketTuru"] == "Giriş" else 0.0, axis=1)
@@ -2306,7 +2305,7 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                 sevk_kalemleri = []
                 for i in range(st.session_state.sevk_satir_sayisi):
                     # Tablet: uzun mamül ve lot açıklamalarını tam satırda göster.
-                    m_sevk_sec = st.selectbox(f"{i+1}. Mamül Parti Seçimi", ["Seçiniz..."] + mamul_secenekleri, key=f"sevk_item_{i}")
+                    m_sevk_sec = st.selectbox(f"{i+1}. Mamül Parti Seçimi", ["Seçiniz..."] + mamul_secenekleri, key=f"sevk_item_{i}", format_func=lambda x: x.split(" - ", 1)[-1] if x != "Seçiniz..." else x)
                     sk2, sk3 = st.columns(2)
                     with sk2:
                         m_sevk_mik = st.number_input(f"Sevk Miktar {i+1}", min_value=0.0, step=1.0, format="%.2f", key=f"sevk_amt_{i}")
@@ -2535,7 +2534,7 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                         st.markdown("---")
                         st.markdown("**Sevk Edilen Kalemler:**")
                         for _, ik in irs_kalemleri.iterrows():
-                            st.write(f"- {ik['StokKodu']} {ik['StokAdi']} | Miktar: {ik['Miktar']:,.2f} {ik['Birim']} | Birim Fiyat: {ik['BirimFiyat']:,.2f} TL | Tutar: {ik['ToplamTutar']:,.2f} TL")
+                            st.write(f"- {ik['StokAdi']} | Miktar: {ik['Miktar']:,.2f} {ik['Birim']} | Birim Fiyat: {ik['BirimFiyat']:,.2f} TL | Tutar: {ik['ToplamTutar']:,.2f} TL")
 
                     if s_row['IlceTarimDocYolu'] and os.path.exists(str(s_row['IlceTarimDocYolu'])):
                         with open(s_row['IlceTarimDocYolu'], "rb") as doc_btn:
@@ -2643,21 +2642,21 @@ elif choice == "7. İzlenebilirlik & İşlem Geçmişi":
                 st.success("İzlenebilirlik kaydı bulundu.")
                 if not hammadde_giris.empty and arama not in is_emirleri:
                     st.subheader("1️⃣ Hammadde / Giriş Lotu")
-                    st.dataframe(hammadde_giris[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                    st.dataframe(hammadde_giris[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]].drop(columns=["StokKodu"], errors="ignore"), use_container_width=True, hide_index=True)
                 if hammaddeler:
                     st.subheader("1️⃣ Kullanılan Hammadde Lotları")
                     hdf = pd.DataFrame(hammaddeler)
-                    st.dataframe(hdf[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                    st.dataframe(hdf[["Tarih","StokKodu","StokAdi","PartiNo","Tedarikci","Miktar","Birim"]].drop(columns=["StokKodu"], errors="ignore"), use_container_width=True, hide_index=True)
                 if is_emirleri:
                     st.subheader("2️⃣ Üretim İş Emri / Mamul Lotu")
                     st.write(" → ".join(is_emirleri))
                 if mamuller:
                     mdf = pd.DataFrame(mamuller)
-                    st.dataframe(mdf[["Tarih","StokKodu","StokAdi","PartiNo","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                    st.dataframe(mdf[["Tarih","StokKodu","StokAdi","PartiNo","Miktar","Birim"]].drop(columns=["StokKodu"], errors="ignore"), use_container_width=True, hide_index=True)
                 if sevkiyatlar:
                     st.subheader("3️⃣ Müşteri / İrsaliye / Sevkiyat")
                     sdf = pd.DataFrame(sevkiyatlar)
-                    st.dataframe(sdf[["Tarih","StokKodu","StokAdi","PartiNo","Musteri","IrsaliyeNo","Miktar","Birim"]], use_container_width=True, hide_index=True)
+                    st.dataframe(sdf[["Tarih","StokKodu","StokAdi","PartiNo","Musteri","IrsaliyeNo","Miktar","Birim"]].drop(columns=["StokKodu"], errors="ignore"), use_container_width=True, hide_index=True)
                 else:
                     st.info("Bu zincire bağlı müşteri sevkiyatı henüz bulunmuyor.")
             else:
