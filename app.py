@@ -2237,14 +2237,14 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
 
             with st.form("shipment_form", clear_on_submit=True):
                 st.subheader("1️⃣ Sevkiyat ve Müşteri Bilgileri")
-                sc1, sc2, sc3 = st.columns(3)
+                sc1, sc3 = st.columns(2)
                 with sc1:
                     sevk_tarihi = st.date_input("Sevkiyat Tarihi", datetime.now())
-                with sc2:
-                    cari_secenekleri = df_cariler["CariAdi"].tolist() if not df_cariler.empty else ["Cari Bulunamadı"]
-                    secilen_musteri = st.selectbox("Sevk Edilen Müşteri (Cari)", cari_secenekleri)
                 with sc3:
                     irsaliye_sevkiyat_no = st.text_input("Sevk İrsaliye / Fatura No *Zorunlu*", placeholder="Örn: IRS-2026-001")
+                # Tablet: müşteri adının tamamını görebilmek için tam genişlik.
+                cari_secenekleri = df_cariler["CariAdi"].tolist() if not df_cariler.empty else ["Cari Bulunamadı"]
+                secilen_musteri = st.selectbox("Sevk Edilen Müşteri (Cari)", cari_secenekleri)
 
                 st.markdown("---")
                 st.subheader("2️⃣ Sevk Edilecek Mamüller, Parti Seçimi ve Satış Fiyatı")
@@ -2253,9 +2253,9 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                 
                 sevk_kalemleri = []
                 for i in range(st.session_state.sevk_satir_sayisi):
-                    sk1, sk2, sk3 = st.columns([2, 1, 1])
-                    with sk1:
-                        m_sevk_sec = st.selectbox(f"{i+1}. Mamül Parti Seçimi", ["Seçiniz..."] + mamul_secenekleri, key=f"sevk_item_{i}")
+                    # Tablet: uzun mamül ve lot açıklamalarını tam satırda göster.
+                    m_sevk_sec = st.selectbox(f"{i+1}. Mamül Parti Seçimi", ["Seçiniz..."] + mamul_secenekleri, key=f"sevk_item_{i}")
+                    sk2, sk3 = st.columns(2)
                     with sk2:
                         m_sevk_mik = st.number_input(f"Sevk Miktar {i+1}", min_value=0.0, step=1.0, format="%.2f", key=f"sevk_amt_{i}")
                     with sk3:
