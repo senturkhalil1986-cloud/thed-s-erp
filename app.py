@@ -469,6 +469,81 @@ def _storage_request_for_bucket(method, bucket, storage_path, data=None, content
         raise RuntimeError(f"Supabase Storage işlemi başarısız: {detail or exc}") from exc
 
 
+
+# Sevkiyat fotograflari: var olan erp-files bucket'i ve ayri SQL metadata tablosu.
+@st.cache_resource(show_spinner=False)
+def ensure_shipment_photo_table():
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.shipment_photos (
+                id BIGSERIAL PRIMARY KEY,
+                irsaliye_no TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                storage_path TEXT NOT NULL UNIQUE,
+                mime_type TEXT,
+                uploaded_by TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shipment_photos_irsaliye ON public.shipment_photos(irsaliye_no)")
+
+
+def shipment_photo_bucket():
+    return str(st.secrets["supabase"].get("bucket", "erp-files"))
+
+
+def upload_shipment_photos(irsaliye_no, photos):
+    if not photos:
+        return 0, []
+    ensure_shipment_photo_table()
+    bucket = shipment_photo_bucket()
+    uploaded = 0
+    errors = []
+    for photo in photos:
+        storage_path = None
+        try:
+            if photo.size > 10 * 1024 * 1024:
+                raise ValueError("Fotoğraf 10 MB sınırını aşıyor")
+            ext = os.path.splitext(photo.name)[1].lower()
+            if ext not in (".png", ".jpg", ".jpeg"):
+                raise ValueError("Desteklenmeyen fotoğraf uzantısı")
+            safe_name = _safe_storage_name(photo.name)
+            # ASCII path: Supabase InvalidKey hatasini Turkce dosya adlarinda onler.
+            import unicodedata
+            safe_name = unicodedata.normalize("NFKD", safe_name).encode("ascii", "ignore").decode("ascii") or "foto.jpg"
+            storage_path = f"sevkiyat/{secrets.token_hex(12)}_{safe_name}"
+            mime = photo.type or mimetypes.guess_type(safe_name)[0] or "image/jpeg"
+            _storage_request_for_bucket("POST", bucket, storage_path, data=photo.getvalue(), content_type=mime)
+            try:
+                with pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO public.shipment_photos
+                            (irsaliye_no, file_name, storage_path, mime_type, uploaded_by)
+                            VALUES (%s, %s, %s, %s, %s)""",
+                            (irsaliye_no, photo.name, storage_path, mime, st.session_state.get("username", "system")))
+            except Exception:
+                try:
+                    _storage_request_for_bucket("DELETE", bucket, storage_path)
+                except Exception:
+                    logging.exception("ORPHAN_SHIPMENT_PHOTO path=%s", storage_path)
+                raise
+            uploaded += 1
+        except Exception as exc:
+            logging.exception("SHIPMENT_PHOTO_UPLOAD_ERROR invoice=%s file=%s", irsaliye_no, photo.name)
+            errors.append(f"{photo.name}: {exc}")
+    if uploaded:
+        list_shipment_photos.clear()
+    return uploaded, errors
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def list_shipment_photos(irsaliye_no):
+    ensure_shipment_photo_table()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT file_name, storage_path FROM public.shipment_photos
+                           WHERE irsaliye_no=%s ORDER BY id""", (str(irsaliye_no).strip(),))
+            return cur.fetchall()
+
 def ensure_sample_tracking_table():
     """Numune takip ana tablosunu oluşturur / günceller."""
     with pg_conn() as conn:
@@ -2317,7 +2392,7 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                 st.subheader("3️⃣ Sevkiyat Görseli and İlçe Tarım Evrakları Arşivi")
                 sc_up1, sc_up2 = st.columns(2)
                 with sc_up1:
-                    uploaded_shipment_photo = st.file_uploader("📸 Sevkiyat / Yükleme Fotoğrafı (Araç, Palet vb.)", type=["png", "jpg", "jpeg"])
+                    uploaded_shipment_photos = st.file_uploader("📸 Sevkiyat / Yükleme Fotoğrafları (çoklu seçim)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, help="Birden fazla fotoğraf seçebilirsiniz. Her fotoğraf en fazla 10 MB.")
                 with sc_up2:
                     uploaded_ilce_tarim_doc = st.file_uploader("🏛️ İlçe Tarım Evrakları / Kontrol Belgesi (PDF, Resim vb.)", type=["pdf", "png", "jpg", "jpeg"])
 
@@ -2375,12 +2450,9 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                             })
 
                         if not hata_sevk:
+                            # Fotoğraflar yerel diske değil Supabase Storage'a kaydedilir.
+                            # Eski meta sütunu geriye dönük uyumluluk için korunur.
                             s_foto_path = ""
-                            if uploaded_shipment_photo is not None:
-                                sf_name = f"sevk_foto_{irsaliye_sevkiyat_no.strip()}_{int(datetime.now().timestamp())}.png"
-                                s_foto_path = os.path.join(SHIPMENT_PHOTO_DIR, sf_name)
-                                with open(s_foto_path, "wb") as f:
-                                    f.write(uploaded_shipment_photo.getbuffer())
 
                             s_doc_path = ""
                             if uploaded_ilce_tarim_doc is not None:
@@ -2408,7 +2480,16 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
                                 "meta": new_ship_meta.to_dict(orient="records")
                             })
 
-                            st.success(f"🎉 Sevkiyat başarıyla gerçekleştirildi, fiyatlandırma işlendi, stoktan düşüldü, İlçe Tarım belgesi ve sevkiyat fotoğrafı arşivlendi!")
+                            st.success("🎉 Sevkiyat kaydedildi ve stoktan düşüldü.")
+                            if uploaded_shipment_photos:
+                                try:
+                                    n_uploaded, photo_errors = upload_shipment_photos(irsaliye_sevkiyat_no.strip(), uploaded_shipment_photos)
+                                    if n_uploaded:
+                                        st.success(f"📸 {n_uploaded} sevkiyat fotoğrafı Supabase Storage'a arşivlendi.")
+                                    if photo_errors:
+                                        st.warning("Bazı fotoğraflar yüklenemedi. Sevkiyat kaydı oluşturuldu; tekrar sevkiyat onaylamayın. Arşivden eksikleri tamamlayabilirsiniz. " + " | ".join(photo_errors))
+                                except Exception as exc:
+                                    st.error(f"Fotoğraf arşivi hatası: {exc}. Sevkiyat zaten kaydedildi; tekrar onaylamayın.")
 
     # Müşteri sevkiyatlarından oluşan satış cirosu
     st.markdown("---")
@@ -2549,10 +2630,38 @@ elif choice == "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)":
 
                 with col_s2:
                     st.markdown("**Sevkiyat Fotoğrafı**")
-                    if s_row['SevkFotoYolu'] and os.path.exists(str(s_row['SevkFotoYolu'])):
-                        st.image(s_row['SevkFotoYolu'], width=200)
-                    else:
-                        st.write("Sevkiyat fotoğrafı yok.")
+                    try:
+                        saved_photos = list_shipment_photos(s_row['IrsaliyeNo'])
+                        if saved_photos:
+                            for photo_index, (photo_name, photo_path) in enumerate(saved_photos):
+                                try:
+                                    photo_bytes = _storage_request_for_bucket("GET", shipment_photo_bucket(), photo_path)
+                                    st.image(photo_bytes, width=220, caption=photo_name)
+                                except Exception as photo_exc:
+                                    st.warning(f"{photo_name} açılamadı: {photo_exc}")
+                        elif s_row['SevkFotoYolu'] and os.path.exists(str(s_row['SevkFotoYolu'])):
+                            st.image(s_row['SevkFotoYolu'], width=200)
+                        else:
+                            st.write("Sevkiyat fotoğrafı yok.")
+                    except Exception as photo_exc:
+                        st.warning(f"Fotoğraf arşivi okunamadı: {photo_exc}")
+                    with st.expander("📸 Bu sevkiyata ek fotoğraf yükle"):
+                        extra_photos = st.file_uploader("Fotoğrafları seç", type=["png", "jpg", "jpeg"],
+                            accept_multiple_files=True, key=f"extra_ship_photos_{idx}")
+                        if st.button("Fotoğrafları arşive ekle", key=f"save_extra_ship_photos_{idx}"):
+                            if not extra_photos:
+                                st.warning("Önce fotoğraf seç.")
+                            else:
+                                try:
+                                    count, errs = upload_shipment_photos(str(s_row['IrsaliyeNo']), extra_photos)
+                                    if count:
+                                        st.success(f"{count} fotoğraf eklendi.")
+                                    if errs:
+                                        st.warning(" | ".join(errs))
+                                    if count:
+                                        st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Fotoğraf yüklenemedi: {exc}")
 
                 with col_s3:
                     st.markdown("**İlçe Tarım Belgesi Önizleme**")
