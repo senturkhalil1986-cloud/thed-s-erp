@@ -1333,19 +1333,19 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
 
             with st.container():  # Form yerine canli guncellenen widgetlar
                 st.subheader("1️⃣ Üretilecek Mamül and Fotoğraf Bilgisi")
-                c1, c2, c3 = st.columns(3)
+                # Tabletlerde uzun mamül adları rahat okunabilsin diye seçim alanı tam genişlikte.
+                c1, c3 = st.columns(2)
                 with c1:
                     uretim_tarihi = st.date_input("Üretim Tarihi", datetime.now())
-                with c2:
-                    mamul_master_df = master_df[master_df["Depo"] == "Mamül Deposu"]
-                    if mamul_master_df.empty:
-                        mamul_options = ["Mamül Deposunda Ürün Yok"]
-                    else:
-                        mamul_options = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
-                    
-                    secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options)
                 with c3:
                     uretilen_miktar = st.number_input("Üretilen Mamül Miktarı", min_value=0.01, step=1.0, format="%.2f")
+
+                mamul_master_df = master_df[master_df["Depo"] == "Mamül Deposu"]
+                if mamul_master_df.empty:
+                    mamul_options = ["Mamül Deposunda Ürün Yok"]
+                else:
+                    mamul_options = [f"{row['StokKodu']} - {row['StokAdi']}" for _, row in mamul_master_df.iterrows()]
+                secilen_mamul_str = st.selectbox("Üretilen Mamül Seçimi", mamul_options)
 
                 uploaded_photo = st.file_uploader("📸 Üretilen Ürüne Ait Fotoğraf / Kalite Kontrol Görseli Yükle", type=["png", "jpg", "jpeg"])
 
