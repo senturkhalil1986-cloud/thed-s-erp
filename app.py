@@ -19,6 +19,14 @@ import json
 import urllib.request
 import urllib.parse
 import mimetypes
+import time
+
+# V3: her Streamlit yeniden calistirmasinin olcum baslangici.
+_V3_RUN_START = time.perf_counter()
+_V3_DB_CONNECT_SEC = 0.0
+_V3_DB_CONNECT_COUNT = 0
+_V3_DB_READ_SEC = 0.0
+_V3_DB_READ_COUNT = 0
 
 st.set_page_config(page_title="THE DIŞ TİCARET - ERP", page_icon="🏭", layout="wide")
 
@@ -32,7 +40,8 @@ def pg_conn():
     """Streamlit Secrets üzerinden Supabase PostgreSQL bağlantısı açar."""
     try:
         cfg = st.secrets["postgres"]
-        return psycopg2.connect(
+        _v3_conn_start = time.perf_counter()
+        connection = psycopg2.connect(
             host=cfg["host"],
             port=int(cfg.get("port", 5432)),
             dbname=cfg.get("database", "postgres"),
@@ -41,6 +50,10 @@ def pg_conn():
             sslmode="require",
             connect_timeout=15,
         )
+        global _V3_DB_CONNECT_SEC, _V3_DB_CONNECT_COUNT
+        _V3_DB_CONNECT_SEC += time.perf_counter() - _v3_conn_start
+        _V3_DB_CONNECT_COUNT += 1
+        return connection
     except Exception as exc:
         raise RuntimeError("Supabase/PostgreSQL bağlantısı kurulamadı. Streamlit Secrets ayarlarını kontrol edin.") from exc
 
@@ -154,6 +167,9 @@ def authenticate(username, password):
     return row[2] if hmac.compare_digest(password_hash(password, salt), stored_hash) else None
 
 def check_password():
+    # Giris yapmis kullanici icin her menude SELECT COUNT(*) yapma.
+    if st.session_state.get("authenticated", False):
+        return True
     if user_count() == 0:
         st.subheader("🔐 İlk Kurulum — Yönetici Hesabı")
         st.info("İlk açılışta yönetici hesabı oluştur. Şifren en az 12 karakter olmalı.")
@@ -238,10 +254,12 @@ def _load_table_cached(table, column_tuple):
         sql.SQL(', ').join(sql.Identifier(c) for c in column_tuple),
         sql.Identifier(table),
     )
+    started = time.perf_counter()
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(query)
             rows = cur.fetchall()
+    logging.info("V3_SQL_READ table=%s rows=%d duration_ms=%.1f", table, len(rows), (time.perf_counter() - started)*1000)
     return pd.DataFrame(rows, columns=list(column_tuple))
 
 
@@ -251,7 +269,11 @@ def load_data(filepath, columns):
     if not columns:
         return pd.DataFrame()
     try:
+        _v3_read_start = time.perf_counter()
         df = _load_table_cached(table, tuple(columns))
+        global _V3_DB_READ_SEC, _V3_DB_READ_COUNT
+        _V3_DB_READ_SEC += time.perf_counter() - _v3_read_start
+        _V3_DB_READ_COUNT += 1
 
         # PostgreSQL NUMERIC alanlari psycopg2 tarafindan Decimal olarak gelebilir.
         # ERP hesaplarinda Decimal/float karisikligi TypeError olusturmasin diye
@@ -776,6 +798,18 @@ if not menu:
     st.stop()
 choice = st.sidebar.radio("📋 ERP Modülleri", menu)
 
+if current_role == "admin":
+    with st.sidebar.expander("⏱️ Performans Ölçümü (V3)"):
+        prev = st.session_state.get("_v3_last_run_metrics")
+        if prev:
+            st.caption(f"Önceki ekran: {prev['screen']}")
+            st.write(f"Toplam Python süresi: **{prev['total_sec']:.2f} sn**")
+            st.write(f"SQL bağlantısı: {prev['connect_sec']:.2f} sn ({prev['connect_count']} adet)")
+            st.write(f"Veri okuma: {prev['read_sec']:.2f} sn ({prev['read_count']} çağrı)")
+            st.caption("Bu ölçüm tarayıcı ağ/görsel oluşturma süresini kapsamaz. Önbellekten okuma da veri okuma süresine dahildir.")
+        else:
+            st.caption("Bir kez menü değiştirince önceki ekranın süreleri burada görünecek.")
+
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Oturum: {st.session_state.get('username','')} • {ROLE_LABELS.get(current_role, current_role)}")
 if st.sidebar.button("Çıkış Yap"):
@@ -804,7 +838,10 @@ if st.session_state.get("role") == "admin":
 
         st.markdown("---")
         st.markdown("**Mevcut Kullanıcılar**")
-        try:
+        # Admin panelindeki kullanici listesi sadece istenince SQL'den okunur.
+        v3_manage_users = st.checkbox("Kullanıcı listesini / yetki düzenlemeyi aç", key="v3_manage_users")
+        if v3_manage_users:
+          try:
             users_df = list_users()
             st.caption(f"Toplam Kullanıcı: {len(users_df)}")
             if users_df.empty:
@@ -857,7 +894,7 @@ if st.session_state.get("role") == "admin":
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
-        except Exception as exc:
+          except Exception as exc:
             st.error(f"Kullanıcı listesi alınamadı: {exc}")
     with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
         st.caption("Sunucudaki geçici dosya/fotoğraf klasörünü kontrol eder. Ana ERP kayıtları Supabase veritabanındadır.")
@@ -2826,3 +2863,18 @@ elif choice == "8. Numune Takip":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Güncelleme yapılamadı: {exc}")
+
+# V3: uygulama betiginin tamamlanma suresi; sadece admin kendi oturumunda gorur.
+_v3_metrics = {
+    "screen": str(choice)[:100],
+    "total_sec": time.perf_counter() - _V3_RUN_START,
+    "connect_sec": _V3_DB_CONNECT_SEC,
+    "connect_count": _V3_DB_CONNECT_COUNT,
+    "read_sec": _V3_DB_READ_SEC,
+    "read_count": _V3_DB_READ_COUNT,
+}
+st.session_state["_v3_last_run_metrics"] = _v3_metrics
+logging.info("V3_PERF screen=%s total_ms=%.1f connect_ms=%.1f connect_count=%d read_ms=%.1f read_count=%d",
+             _v3_metrics["screen"], _v3_metrics["total_sec"]*1000,
+             _v3_metrics["connect_sec"]*1000, _v3_metrics["connect_count"],
+             _v3_metrics["read_sec"]*1000, _v3_metrics["read_count"])
