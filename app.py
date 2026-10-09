@@ -1519,7 +1519,7 @@ elif choice == "2A. Depo Çıkışı / İade / Zayi":
                     exit_date = st.date_input("Çıkış Tarihi", value=datetime.today(), key="nonprod_exit_date")
                     exit_reason = st.selectbox("Çıkış Nedeni", ["Tedarikçiye İade", "Zayi / İmha", "Numune Çıkışı", "Diğer Depo Dışı Çıkış"])
                 with c2:
-                    exit_qty = st.number_input(f"Çıkış Miktarı ({selected['unit']})", min_value=0.0, max_value=float(selected['remaining']), value=0.0, step=1.0, format="%.2f")
+                    exit_qty = st.number_input(f"Çıkış Miktarı ({selected['unit']})", min_value=0.0, value=0.0, step=1.0, format="%.2f", help=f"Mevcut stok: {selected['remaining']:,.2f} {selected['unit']}. Üst sınır kayıt sırasında güncel SQL stoğundan kontrol edilir.")
                     doc_number = st.text_input("İade / İrsaliye / Tutanak No")
                 exit_note = st.text_area("Açıklama / İade Edilen Firma", placeholder="İade nedeni, karşı firma ve gerekli açıklamalar")
                 confirmed = st.checkbox("Seçilen partiden belirtilen miktarın stoktan düşüleceğini onaylıyorum")
@@ -1527,6 +1527,8 @@ elif choice == "2A. Depo Çıkışı / İade / Zayi":
             if submit_exit:
                 if exit_qty <= 0:
                     st.error("Çıkış miktarı sıfırdan büyük olmalı.")
+                elif exit_qty > selected["remaining"] + 0.000001:
+                    st.error(f"Seçilen partide görünen stok yetersiz: {selected['remaining']:,.2f} {selected['unit']}")
                 elif not doc_number.strip():
                     st.error("İade / irsaliye / tutanak numarası girilmeli.")
                 elif not confirmed:
