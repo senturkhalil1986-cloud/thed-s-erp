@@ -838,6 +838,7 @@ ALL_MENU = [
     "0. Yönetici Dashboard",
     "1. Stok Kartı Tanımlama",
     "2. Depo / Malzeme Girişi",
+    "2A. Depo Çıkışı / İade / Zayi",
     "3. Cari dan Ürün Spek Yönetimi",
     "4. Üretime Sevk / Reçeteli Üretim and Maliyet",
     "5. Stok Durumu, Hareket Panosu and Föy Düzenleme",
@@ -858,9 +859,9 @@ ROLE_LABELS = {
 ROLE_MODULES = {
     "admin": ALL_MENU,
     "yonetici": ALL_MENU,
-    "depo": [ALL_MENU[2], ALL_MENU[4], ALL_MENU[5], ALL_MENU[7], ALL_MENU[8]],
-    "uretim": [ALL_MENU[4], ALL_MENU[5], ALL_MENU[7], ALL_MENU[8]],
-    "satis": [ALL_MENU[6], ALL_MENU[7], ALL_MENU[8]],
+    "depo": [ALL_MENU[2], ALL_MENU[3], ALL_MENU[5], ALL_MENU[6], ALL_MENU[8], ALL_MENU[9]],
+    "uretim": [ALL_MENU[5], ALL_MENU[6], ALL_MENU[8], ALL_MENU[9]],
+    "satis": [ALL_MENU[7], ALL_MENU[8], ALL_MENU[9]],
     # Eski kullanıcıların erişimini bir anda bozmamak için geriye dönük uyumluluk.
     "personel": ALL_MENU[1:],
 }
@@ -1484,6 +1485,85 @@ elif choice == "3. Cari dan Ürün Spek Yönetimi":
                                 st.image(row['UrunFotoYolu'], caption="Spek Uyumlu Ürün", width=200)
                             else:
                                 st.info("Ürün fotoğrafı yüklenmemiş.")
+
+
+# --- 2A. URETIM DISI DEPO CIKISI / TEDARIKCI IADESI ---
+elif choice == "2A. Depo Çıkışı / İade / Zayi":
+    st.header("📤 Depo Çıkışı / Tedarikçi İadesi / Zayi")
+    st.caption("Üretim ve müşteri sevkiyatı dışında kalan stok çıkışları. Lot bazında izlenebilirlik korunur.")
+    tx_out = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Birim", "Miktar", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
+    if tx_out.empty:
+        st.info("Önce depoya malzeme girişi yapılmalı.")
+    else:
+        incoming = tx_out[tx_out["HareketTuru"] == "Giriş"].copy()
+        outgoing = tx_out[tx_out["HareketTuru"] == "Çıkış"].copy()
+        if not outgoing.empty:
+            used = outgoing.assign(_lot=outgoing["PartiNo"].astype(str).str.strip()).groupby(["StokKodu", "Depo", "_lot"])["Miktar"].sum().to_dict()
+        else:
+            used = {}
+        lots = []
+        for _, rec in incoming.iterrows():
+            lot = str(rec["PartiNo"]).strip()
+            remaining = float(rec["Miktar"]) - float(used.get((rec["StokKodu"], rec["Depo"], lot), 0))
+            if remaining > 0.000001:
+                lots.append({"code": str(rec["StokKodu"]), "name": str(rec["StokAdi"]), "depot": str(rec["Depo"]), "lot": lot, "unit": str(rec["Birim"]), "remaining": remaining, "price": float(rec["BirimFiyat"]), "supplier": str(rec["Tedarikci"])})
+        if not lots:
+            st.info("Çıkış yapılabilecek stok bulunmuyor.")
+        else:
+            choices = {f"{i+1}. {x['name']} | Depo: {x['depot']} | Parti/Lot: {x['lot']} | Kalan: {x['remaining']:,.2f} {x['unit']}": i for i,x in enumerate(lots)}
+            with st.form("nonproduction_stock_out_form", clear_on_submit=False):
+                selection = st.selectbox("Çıkış Yapılacak Ürün ve Parti", list(choices))
+                selected = lots[choices[selection]]
+                c1,c2 = st.columns(2)
+                with c1:
+                    exit_date = st.date_input("Çıkış Tarihi", value=datetime.today(), key="nonprod_exit_date")
+                    exit_reason = st.selectbox("Çıkış Nedeni", ["Tedarikçiye İade", "Zayi / İmha", "Numune Çıkışı", "Diğer Depo Dışı Çıkış"])
+                with c2:
+                    exit_qty = st.number_input(f"Çıkış Miktarı ({selected['unit']})", min_value=0.0, max_value=float(selected['remaining']), value=0.0, step=1.0, format="%.2f")
+                    doc_number = st.text_input("İade / İrsaliye / Tutanak No")
+                exit_note = st.text_area("Açıklama / İade Edilen Firma", placeholder="İade nedeni, karşı firma ve gerekli açıklamalar")
+                confirmed = st.checkbox("Seçilen partiden belirtilen miktarın stoktan düşüleceğini onaylıyorum")
+                submit_exit = st.form_submit_button("📤 Depo Çıkışını Kaydet", type="primary")
+            if submit_exit:
+                if exit_qty <= 0:
+                    st.error("Çıkış miktarı sıfırdan büyük olmalı.")
+                elif not doc_number.strip():
+                    st.error("İade / irsaliye / tutanak numarası girilmeli.")
+                elif not confirmed:
+                    st.error("Stok düşüm onayını işaretlemelisin.")
+                else:
+                    try:
+                        # PostgreSQL advisory transaction lock: eszamanli iade islemlerini siralar.
+                        # Yeni cikis INSERT olarak eklenir; mevcut stok tablosu silinip yazilmaz.
+                        with pg_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("erp_stock_transactions",))
+                                cur.execute("""SELECT "HareketTuru", "Miktar" FROM public.stock_transactions
+                                               WHERE "StokKodu"=%s AND "Depo"=%s AND TRIM("PartiNo")=%s""",
+                                            (selected["code"], selected["depot"], selected["lot"]))
+                                records = cur.fetchall()
+                                # Ayni belge numarasiyla yanlislikla tekrar stok dusulmesini engelle.
+                                cur.execute('SELECT COUNT(*) FROM public.stock_transactions WHERE "HareketTuru"=%s AND "Aciklama" LIKE %s', ("Çıkış", f"%| Belge: {doc_number.strip()} |%"))
+                                if cur.fetchone()[0] > 0:
+                                    raise ValueError("Bu belge numarasıyla daha önce depo çıkışı kaydedilmiş. Tekrar kaydetmeyin.")
+                                available = sum(float(q) if t == "Giriş" else -float(q) if t == "Çıkış" else 0 for t,q in records)
+                                if exit_qty > available + 0.000001:
+                                    raise ValueError(f"Güncel stok yetersiz. Kalan: {available:,.2f} {selected['unit']}")
+                                note = f"{exit_reason} | Belge: {doc_number.strip()} | {exit_note.strip()}"
+                                cur.execute("""INSERT INTO public.stock_transactions
+                                    ("Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Birim", "Miktar", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama")
+                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                    (str(exit_date), "Çıkış", selected["depot"], selected["code"], selected["name"], selected["unit"], float(exit_qty), selected["price"], float(exit_qty)*selected["price"], selected["lot"], selected["supplier"], note))
+                        _load_table_cached.clear()
+                        audit_log("OLUŞTURMA", "URETIM_DISI_DEPO_CIKISI", doc_number.strip(), new_value={"stok_kodu": selected["code"], "stok_adi": selected["name"], "depo": selected["depot"], "parti": selected["lot"], "miktar": exit_qty, "birim": selected["unit"], "neden": exit_reason, "belge": doc_number.strip(), "aciklama": exit_note.strip()})
+                        st.success(f"Çıkış kaydedildi: {exit_qty:,.2f} {selected['unit']} | {selected['name']} | Parti: {selected['lot']}")
+                        st.info("Bu işlem stoktan bir kez düşüldü. Aynı belgeyi tekrar kaydetmeyin.")
+                    except Exception as exc:
+                        st.error(f"Çıkış kaydedilemedi: {exc}")
+            st.markdown("#### Son Üretim Dışı Çıkışlar")
+            history = tx_out[(tx_out["HareketTuru"] == "Çıkış") & (tx_out["Aciklama"].astype(str).str.contains("Tedarikçiye İade|Zayi / İmha|Numune Çıkışı|Diğer Depo Dışı Çıkış", regex=True, na=False))]
+            if not history.empty:
+                st.dataframe(history[["Tarih", "StokAdi", "Depo", "PartiNo", "Miktar", "Birim", "Aciklama"]].tail(30).iloc[::-1], use_container_width=True, hide_index=True)
 
 # --- 4. ÜRETIME SEVK / REÇETELİ ÜRETİME VE MALİYET ---
 elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
