@@ -1104,6 +1104,24 @@ if choice == "0. Yönetici Dashboard":
                 st.bar_chart(au.set_index("Ay")["Miktar"])
             else: st.info("Henüz mamul üretimi yok.")
 
+        # Yalnızca müşteri sevkiyatları; Kg dışındaki birimler tonaja katılmaz.
+        st.markdown("---")
+        st.subheader("🚚 Aylık Sevkiyat Miktarı (Ton)")
+        if not sevk.empty:
+            sevk_kg = sevk[
+                sevk["Birim"].astype(str).str.strip().str.casefold().isin(["kg", "kilogram"])
+            ].dropna(subset=["Tarih_dt"]).copy()
+            if not sevk_kg.empty:
+                sevk_kg["Ay"] = sevk_kg["Tarih_dt"].dt.to_period("M").astype(str)
+                aylik_ton = sevk_kg.groupby("Ay", as_index=False)["Miktar"].sum()
+                aylik_ton["Ton"] = aylik_ton["Miktar"] / 1000.0
+                st.bar_chart(aylik_ton.set_index("Ay")["Ton"], y_label="Ton")
+                st.caption("Yalnızca müşteri sevkiyatı olarak kaydedilen Kg birimli mamuller dahil edilir. İade, zayi, üretim sarfiyatı ve Adet birimli ürünler dahil değildir.")
+            else:
+                st.info("Tonaj grafiği için Kg birimli müşteri sevkiyatı bulunmuyor.")
+        else:
+            st.info("Henüz müşteri sevkiyatı bulunmuyor.")
+
         st.markdown("---")
         st.subheader("💰 Gerçek Kârlılık — Sevkiyat / Ürün / Müşteri")
         if kar_satirlari:
