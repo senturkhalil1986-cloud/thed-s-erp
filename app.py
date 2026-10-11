@@ -3326,7 +3326,21 @@ elif choice == "9. Üretim Formları":
                 st.subheader(f"{form.form_type} — {form.status}")
                 with pg_conn() as conn:
                     entries = pd.read_sql_query("SELECT id,created_at,entered_by,data FROM public.qc_form_entries WHERE form_id=%s ORDER BY id", conn, params=(fid,))
-                if not entries.empty:
+                metal_grid_cols = ["Kontrol Saati", "Fe Testi", "NonFe Testi", "SS Testi", "Alarm / Red Sistemi", "Açıklama"]
+                if form.form_type == "Metal Dedektör Kontrol":
+                    # Kaydedilmis kontroller ayni Excel gorunumunde sabit kalir.
+                    # Sadece yeni satirlar alttaki giris tablosundan eklenir.
+                    saved_rows = []
+                    for r in entries.itertuples(index=False):
+                        values = r.data if isinstance(r.data, dict) else {}
+                        saved_rows.append({**{c: str(values.get(c) or "") for c in metal_grid_cols},
+                                           "Kontrol Eden": str(r.entered_by),
+                                           "Kayıt Zamanı": str(r.created_at)})
+                    if saved_rows:
+                        st.dataframe(pd.DataFrame(saved_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Henüz kaydedilmiş kontrol satırı yok. Aşağıdaki tabloya ilk kontrolü girin.")
+                elif not entries.empty:
                     table_rows = [{"Kayıt No": int(r.id), "Zaman": str(r.created_at), "Personel": r.entered_by, **r.data} for r in entries.itertuples(index=False)]
                     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
                 else:
@@ -3335,7 +3349,7 @@ elif choice == "9. Üretim Formları":
                     if form.status == "Düzeltmeye İade":
                         st.warning("İade gerekçesi: " + str(form.return_reason or "Belirtilmedi"))
                     if form.form_type == "Metal Dedektör Kontrol":
-                        st.caption("Saatler serbesttir. Tablonun en altından yeni kontrol satırları ekleyebilirsiniz. Kaydedilen satırlar üstte görünür.")
+                        st.caption("Kaydedilen kontroller yukarıdaki tabloda dolu kalır. Yeni kontrolü aşağıya girip kaydedin; saatler serbesttir.")
                         grid_cols = ["Kontrol Saati", "Fe Testi", "NonFe Testi", "SS Testi", "Alarm / Red Sistemi", "Açıklama"]
                         with st.form(f"qc_metal_grid_{fid}", clear_on_submit=True):
                             draft = st.data_editor(
