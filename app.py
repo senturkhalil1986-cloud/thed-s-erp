@@ -1912,11 +1912,12 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                                     st.error(f"Fotoğraf yüklenemedi. Üretim kaydı yapılmadı: {exc}")
                                     st.stop()
 
-                            meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar"])
+                            meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar", "PersonelSayisi"])
                             meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != is_emri_no.strip()]
                             new_meta = pd.DataFrame([{
                                 "IsEmriNo": is_emri_no.strip(),
                                 "CalismaSaati": calisma_suresi_saat,
+                                "PersonelSayisi": int(isci_sayisi),
                                 "IscilikGideri": toplam_iscilik_gideri,
                                 "FotografYolu": photo_path,
                                 "Notlar": aciklama
@@ -1939,7 +1940,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
     st.header("📊 Stok Durumu, Hareket Panosu, Üretim İptali and Föy Düzenleme")
     
     tx_df = load_data(STOCK_TRANSACTIONS_FILE, ["Tarih", "HareketTuru", "Depo", "StokKodu", "StokAdi", "Miktar", "Birim", "BirimFiyat", "ToplamTutar", "PartiNo", "Tedarikci", "Aciklama"])
-    meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar"])
+    meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar", "PersonelSayisi"])
     master_df = load_data(MASTER_ITEMS_FILE, ["StokKodu", "StokAdi", "Depo", "Birim"])
     
     if tx_df.empty:
@@ -1957,6 +1958,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 
                 meta_row = meta_df[meta_df["IsEmriNo"].astype(str) == str(secilen_is_emri)]
                 mevcut_sure = float(meta_row.iloc[0]["CalismaSaati"]) if not meta_row.empty and str(meta_row.iloc[0]["CalismaSaati"]) != "" else 8.0
+                mevcut_isci_sayisi = int(meta_row.iloc[0]["PersonelSayisi"]) if not meta_row.empty and pd.notna(meta_row.iloc[0]["PersonelSayisi"]) and float(meta_row.iloc[0]["PersonelSayisi"]) >= 1 else None
                 mevcut_gider = float(meta_row.iloc[0]["IscilikGideri"]) if not meta_row.empty and str(meta_row.iloc[0]["IscilikGideri"]) != "" else 0.0
                 mevcut_foto = str(meta_row.iloc[0]["FotografYolu"]) if not meta_row.empty else ""
                 mevcut_not = str(meta_row.iloc[0]["Notlar"]) if not meta_row.empty else mamul_satir["Aciklama"]
@@ -2093,7 +2095,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
 
                         st.markdown("---")
                         st.subheader("4️⃣ Çalışma Süresi, İşçilik and Diğer Giderler")
-                        ed_col1, ed_col2 = st.columns(2)
+                        ed_col1, ed_col2, ed_col3 = st.columns(3)
                         with ed_col1:
                             yeni_sure = st.number_input("Çalışma Süresi (Saat)", min_value=0.0, value=mevcut_sure, step=0.5)
                         with ed_col2:
@@ -2103,6 +2105,11 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                 yeni_gider = mevcut_gider
                                 st.caption("Maliyet bilgisi yönetici yetkisindedir.")
                         
+                        with ed_col3:
+                            if mevcut_isci_sayisi is None:
+                                st.warning("Bu eski üretimde personel sayısı kayıtlı değil. Lütfen doğru sayıyı girin.")
+                            yeni_isci_sayisi = st.number_input("İşçi / Personel Sayısı", min_value=1, value=mevcut_isci_sayisi or 1, step=1, key=f"edit_worker_count_{secilen_is_emri}")
+
                         yeni_fotograf = st.file_uploader("Yeni / Değiştirilecek Fotoğraf Yükle", type=["png", "jpg", "jpeg"], key=f"up_{secilen_is_emri}")
                         yeni_not = st.text_area("Föy / Üretim Notunu Güncelle", value=mevcut_not)
 
@@ -2250,6 +2257,7 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     new_meta = pd.DataFrame([{
                                         "IsEmriNo": str(secilen_is_emri),
                                         "CalismaSaati": yeni_sure,
+                                        "PersonelSayisi": int(yeni_isci_sayisi),
                                         "IscilikGideri": yeni_gider,
                                         "FotografYolu": final_photo_path,
                                         "Notlar": yeni_not
