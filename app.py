@@ -3334,24 +3334,71 @@ elif choice == "9. Üretim Formları":
                 if form.status in ("Açık", "Düzeltmeye İade"):
                     if form.status == "Düzeltmeye İade":
                         st.warning("İade gerekçesi: " + str(form.return_reason or "Belirtilmedi"))
-                    with st.form(f"qc_entry_{fid}", clear_on_submit=True):
-                        vals = {}
-                        for field in FORM_FIELDS[form.form_type]:
-                            vals[field] = st.text_input(field, key=f"qc_{fid}_{field}") if field != "Açıklama" else st.text_area(field, key=f"qc_{fid}_{field}")
-                        add_entry = st.form_submit_button("💾 Kontrol Satırını Kaydet")
-                    if add_entry:
-                        if not any(str(v).strip() for v in vals.values()):
-                            st.error("En az bir alan doldurulmalıdır.")
-                        else:
-                            with pg_conn() as conn:
-                                with conn.cursor() as cur:
-                                    cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
-                                    if cur.fetchone()[0] not in ("Açık", "Düzeltmeye İade"):
-                                        st.error("Form artık kayıt kabul etmiyor; sayfayı yenileyin.")
-                                    else:
-                                        cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid,Json(vals),username))
-                                        st.success("Kontrol kaydedildi.")
-                                        st.rerun()
+                    if form.form_type == "Metal Dedektör Kontrol":
+                        st.caption("Saatler serbesttir. Tablonun en altından yeni kontrol satırları ekleyebilirsiniz. Kaydedilen satırlar üstte görünür.")
+                        grid_cols = ["Kontrol Saati", "Fe Testi", "NonFe Testi", "SS Testi", "Alarm / Red Sistemi", "Açıklama"]
+                        with st.form(f"qc_metal_grid_{fid}", clear_on_submit=True):
+                            draft = st.data_editor(
+                                pd.DataFrame([{col: "" for col in grid_cols}]),
+                                num_rows="dynamic", use_container_width=True, hide_index=True,
+                                key=f"qc_metal_editor_{fid}",
+                                column_config={
+                                    "Kontrol Saati": st.column_config.TextColumn("Kontrol Saati (SS:DD)", help="Örnek: 07:30, 10:15"),
+                                    "Fe Testi": st.column_config.TextColumn("Fe Testi"),
+                                    "NonFe Testi": st.column_config.TextColumn("NonFe Testi"),
+                                    "SS Testi": st.column_config.TextColumn("SS Testi"),
+                                    "Alarm / Red Sistemi": st.column_config.TextColumn("Alarm / Red Sistemi"),
+                                    "Açıklama": st.column_config.TextColumn("Açıklama"),
+                                },
+                            )
+                            add_entry = st.form_submit_button("💾 Doldurulan Kontrol Satırlarını Kaydet")
+                        if add_entry:
+                            new_rows = []
+                            for _, row in draft.iterrows():
+                                vals = {col: "" if pd.isna(row[col]) else str(row[col]).strip() for col in grid_cols}
+                                if any(vals.values()):
+                                    if not vals["Kontrol Saati"]:
+                                        st.error("Her dolu satır için Kontrol Saati zorunludur.")
+                                        new_rows = None
+                                        break
+                                    new_rows.append(vals)
+                            if new_rows is not None:
+                                if not new_rows:
+                                    st.warning("Kaydetmek için en az bir kontrol satırı doldurun.")
+                                else:
+                                    try:
+                                        with pg_conn() as conn:
+                                            with conn.cursor() as cur:
+                                                cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
+                                                state_row = cur.fetchone()
+                                                if not state_row or state_row[0] not in ("Açık", "Düzeltmeye İade"):
+                                                    st.error("Form artık kayıt kabul etmiyor; sayfayı yenileyin.")
+                                                else:
+                                                    for vals in new_rows:
+                                                        cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid, Json(vals), username))
+                                                    st.success(f"{len(new_rows)} kontrol satırı kaydedildi.")
+                                                    st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"Kontroller kaydedilemedi: {exc}")
+                    else:
+                        with st.form(f"qc_entry_{fid}", clear_on_submit=True):
+                            vals = {}
+                            for field in FORM_FIELDS[form.form_type]:
+                                vals[field] = st.text_input(field, key=f"qc_{fid}_{field}") if field != "Açıklama" else st.text_area(field, key=f"qc_{fid}_{field}")
+                            add_entry = st.form_submit_button("💾 Kontrol Satırını Kaydet")
+                        if add_entry:
+                            if not any(str(v).strip() for v in vals.values()):
+                                st.error("En az bir alan doldurulmalıdır.")
+                            else:
+                                with pg_conn() as conn:
+                                    with conn.cursor() as cur:
+                                        cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
+                                        if cur.fetchone()[0] not in ("Açık", "Düzeltmeye İade"):
+                                            st.error("Form artık kayıt kabul etmiyor; sayfayı yenileyin.")
+                                        else:
+                                            cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid,Json(vals),username))
+                                            st.success("Kontrol kaydedildi.")
+                                            st.rerun()
                     if st.button("📨 Üretim Bitti / Onaya Gönder", key=f"submit_{fid}"):
                         with pg_conn() as conn:
                             with conn.cursor() as cur:
