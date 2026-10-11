@@ -961,7 +961,8 @@ ALL_MENU = [
     "5. Stok Durumu, Hareket Panosu and Föy Düzenleme",
     "6. Sevkiyat & Çıkış Yönetimi (İlçe Tarım & Foto)",
     "7. İzlenebilirlik & İşlem Geçmişi",
-    "8. Numune Takip"
+    "8. Numune Takip",
+    "9. Üretim Formları"
 ]
 
 # Rol bazlı modül yetkileri. Admin tüm modüllere erişir.
@@ -982,6 +983,8 @@ ROLE_MODULES = {
     # Eski kullanıcıların erişimini bir anda bozmamak için geriye dönük uyumluluk.
     "personel": ALL_MENU[1:],
 }
+for _role_name in ("depo", "uretim", "satis", "personel"):
+    ROLE_MODULES[_role_name] = list(dict.fromkeys(ROLE_MODULES[_role_name] + [ALL_MENU[-1]]))
 current_role = st.session_state.get("role", "personel")
 # Finansal bilgiler yalnızca yönetici ve admin rollerinde görünür.
 can_view_financial = current_role in ("admin", "yonetici")
@@ -3232,6 +3235,165 @@ elif choice == "8. Numune Takip":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Güncelleme yapılamadı: {exc}")
+
+elif choice == "9. Üretim Formları":
+    st.header("📋 Üretim Formları ve Kalite Kontrol")
+    st.caption("Bu bölüm stok miktarlarını ve mevcut üretim kayıtlarını değiştirmez.")
+    FORM_FIELDS = {
+        "Metal Dedektör Kontrol": ["Kontrol Saati", "Fe Testi", "NonFe Testi", "SS Testi", "Alarm / Red Sistemi", "Açıklama"],
+        "Salamura Hazırlama / Kalite Takip": ["Tank No", "Hammadde Lot No", "Hammadde Miktarı", "Hedef Konsantrasyon", "Ölçülen Konsantrasyon", "pH", "Açıklama"],
+        "Üretim Raporu": ["Yapılan Üretim", "Hammadde Lot No", "Dolum Ağırlığı", "Ürün Adedi", "Fire", "Çöp", "Toplam Miktar", "Kişi Sayısı", "Baş Saati", "Bitiş Saati", "Açıklama"],
+        "Mıknatıs ve Yabancı Madde Kontrol": ["Kontrol Saati", "Bulunan Yabancı Maddeler", "Düzeltme / Düzeltici Faaliyet", "Açıklama"],
+    }
+    def forms_init():
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS public.qc_productions (
+                    id BIGSERIAL PRIMARY KEY, stok_kodu TEXT NOT NULL, stok_adi TEXT NOT NULL,
+                    parti_no TEXT NOT NULL, opened_by TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS public.qc_forms (
+                    id BIGSERIAL PRIMARY KEY, production_id BIGINT NOT NULL REFERENCES public.qc_productions(id),
+                    form_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Açık'
+                    CHECK (status IN ('Açık','Onay Bekliyor','Onaylandı','Düzeltmeye İade')),
+                    created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    submitted_by TEXT, submitted_at TIMESTAMPTZ,
+                    approved_by TEXT, approved_at TIMESTAMPTZ, return_reason TEXT)""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS public.qc_form_entries (
+                    id BIGSERIAL PRIMARY KEY, form_id BIGINT NOT NULL REFERENCES public.qc_forms(id),
+                    data JSONB NOT NULL, entered_by TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+                cur.execute("CREATE INDEX IF NOT EXISTS qc_forms_production_idx ON public.qc_forms(production_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS qc_entries_form_idx ON public.qc_form_entries(form_id)")
+    try:
+        forms_init()
+        username = st.session_state["username"]
+        with st.expander("➕ Yeni üretim aç ve formları seç", expanded=False):
+            items = load_data(MASTER_ITEMS_FILE, ["StokKodu", "StokAdi", "Depo"])
+            mamul = items[items["Depo"].astype(str).str.strip() == "Mamül Deposu"].copy()
+            mamul = mamul[mamul["StokKodu"].astype(str).str.upper().str.startswith("MML")]
+            options = {f"{r.StokKodu} — {r.StokAdi}": (str(r.StokKodu), str(r.StokAdi)) for r in mamul.itertuples(index=False)}
+            if not options:
+                st.warning("Mamül Deposunda MML ile başlayan stok kodu bulunamadı.")
+            else:
+                with st.form("qc_new_production"):
+                    chosen = st.selectbox("MML Mamul Stok Kodu", list(options))
+                    lot = st.text_input("Üretim Parti / Lot No (manuel)")
+                    types = st.multiselect("Açılacak Formlar (birden fazla seçilebilir)", list(FORM_FIELDS))
+                    save_new = st.form_submit_button("Üretimi ve Seçilen Formları Aç")
+                if save_new:
+                    if not lot.strip() or not types:
+                        st.error("Parti numarası ve en az bir form zorunludur.")
+                    else:
+                        code, name = options[chosen]
+                        with pg_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("INSERT INTO public.qc_productions(stok_kodu,stok_adi,parti_no,opened_by) VALUES(%s,%s,%s,%s) RETURNING id", (code,name,lot.strip(),username))
+                                production_id = cur.fetchone()[0]
+                                for form_type in types:
+                                    cur.execute("INSERT INTO public.qc_forms(production_id,form_type,created_by) VALUES(%s,%s,%s)", (production_id,form_type,username))
+                        st.success(f"Üretim #{production_id} ve {len(types)} form açıldı.")
+                        st.rerun()
+        with pg_conn() as conn:
+            productions = pd.read_sql_query("SELECT id,stok_kodu,stok_adi,parti_no,opened_by,created_at FROM public.qc_productions ORDER BY id DESC LIMIT 300", conn)
+        if productions.empty:
+            st.info("Henüz üretim form kaydı açılmadı.")
+        else:
+            pids = productions["id"].astype(int).tolist()
+            selected_pid = st.selectbox("Üretim Seç", pids, format_func=lambda x: (lambda r: f"#{x} | {r.stok_kodu} | {r.parti_no} | {r.stok_adi}")(productions[productions.id == x].iloc[0]))
+            with pg_conn() as conn:
+                forms = pd.read_sql_query("SELECT id,form_type,status,created_by,created_at,submitted_by,approved_by,return_reason FROM public.qc_forms WHERE production_id=%s ORDER BY id", conn, params=(selected_pid,))
+            statuses = ["Açık", "Onay Bekliyor", "Onaylandı", "Düzeltmeye İade"]
+            metrics = st.columns(4)
+            for col, state in zip(metrics, statuses):
+                col.metric(state, int((forms.status == state).sum()) if not forms.empty else 0)
+            with st.expander("➕ Bu üretime başka form ekle"):
+                extra = st.multiselect("Form Türleri", list(FORM_FIELDS), key=f"extra_{selected_pid}")
+                if st.button("Seçilen Formları Ekle", key=f"add_{selected_pid}"):
+                    if not extra:
+                        st.warning("Form seçiniz.")
+                    else:
+                        with pg_conn() as conn:
+                            with conn.cursor() as cur:
+                                for form_type in extra:
+                                    cur.execute("INSERT INTO public.qc_forms(production_id,form_type,created_by) VALUES(%s,%s,%s)", (selected_pid,form_type,username))
+                        st.rerun()
+            if not forms.empty:
+                st.dataframe(forms[["id","form_type","status","created_by","created_at"]].rename(columns={"id":"Form No","form_type":"Form","status":"Durum","created_by":"Açan","created_at":"Açılış"}), hide_index=True, use_container_width=True)
+                form_ids = forms.id.astype(int).tolist()
+                fid = st.selectbox("İşlem Yapılacak Form", form_ids, format_func=lambda x: (lambda r: f"#{x} | {r.form_type} | {r.status}")(forms[forms.id == x].iloc[0]))
+                form = forms[forms.id == fid].iloc[0]
+                st.subheader(f"{form.form_type} — {form.status}")
+                with pg_conn() as conn:
+                    entries = pd.read_sql_query("SELECT id,created_at,entered_by,data FROM public.qc_form_entries WHERE form_id=%s ORDER BY id", conn, params=(fid,))
+                if not entries.empty:
+                    table_rows = [{"Kayıt No": int(r.id), "Zaman": str(r.created_at), "Personel": r.entered_by, **r.data} for r in entries.itertuples(index=False)]
+                    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Bu forma henüz kontrol satırı girilmedi.")
+                if form.status in ("Açık", "Düzeltmeye İade"):
+                    if form.status == "Düzeltmeye İade":
+                        st.warning("İade gerekçesi: " + str(form.return_reason or "Belirtilmedi"))
+                    with st.form(f"qc_entry_{fid}", clear_on_submit=True):
+                        vals = {}
+                        for field in FORM_FIELDS[form.form_type]:
+                            vals[field] = st.text_input(field, key=f"qc_{fid}_{field}") if field != "Açıklama" else st.text_area(field, key=f"qc_{fid}_{field}")
+                        add_entry = st.form_submit_button("💾 Kontrol Satırını Kaydet")
+                    if add_entry:
+                        if not any(str(v).strip() for v in vals.values()):
+                            st.error("En az bir alan doldurulmalıdır.")
+                        else:
+                            with pg_conn() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
+                                    if cur.fetchone()[0] not in ("Açık", "Düzeltmeye İade"):
+                                        st.error("Form artık kayıt kabul etmiyor; sayfayı yenileyin.")
+                                    else:
+                                        cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid,Json(vals),username))
+                                        st.success("Kontrol kaydedildi.")
+                                        st.rerun()
+                    if st.button("📨 Üretim Bitti / Onaya Gönder", key=f"submit_{fid}"):
+                        with pg_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""UPDATE public.qc_forms SET status='Onay Bekliyor',submitted_by=%s,submitted_at=NOW(),return_reason=NULL
+                                               WHERE id=%s AND status IN ('Açık','Düzeltmeye İade')
+                                               AND EXISTS(SELECT 1 FROM public.qc_form_entries WHERE form_id=%s)""", (username,fid,fid))
+                                updated = cur.rowcount
+                        if updated:
+                            st.success("Form onaya gönderildi.")
+                            st.rerun()
+                        else:
+                            st.error("Onaya göndermek için en az bir kontrol kaydı olmalı; formun durumunu da kontrol edin.")
+                elif form.status == "Onay Bekliyor":
+                    st.info("Form yönetici onayı bekliyor; personel düzenleyemez.")
+                    if current_role in ("admin", "yonetici"):
+                        reason = st.text_area("Düzeltmeye iade gerekçesi", key=f"reason_{fid}")
+                        approve_col, return_col = st.columns(2)
+                        with approve_col:
+                            if st.button("✅ Onayla", key=f"approve_{fid}"):
+                                with pg_conn() as conn:
+                                    with conn.cursor() as cur:
+                                        cur.execute("UPDATE public.qc_forms SET status='Onaylandı',approved_by=%s,approved_at=NOW() WHERE id=%s AND status='Onay Bekliyor'", (username,fid))
+                                        updated = cur.rowcount
+                                if updated:
+                                    st.success("Onaylandı.")
+                                    st.rerun()
+                        with return_col:
+                            if st.button("↩️ Düzeltmeye İade", key=f"return_{fid}"):
+                                if not reason.strip():
+                                    st.error("İade gerekçesi zorunludur.")
+                                else:
+                                    with pg_conn() as conn:
+                                        with conn.cursor() as cur:
+                                            cur.execute("UPDATE public.qc_forms SET status='Düzeltmeye İade',return_reason=%s,approved_by=NULL,approved_at=NULL WHERE id=%s AND status='Onay Bekliyor'", (reason.strip(),fid))
+                                            updated = cur.rowcount
+                                    if updated:
+                                        st.rerun()
+                else:
+                    st.success("Form onaylandı ve kayıt girişine kapatıldı.")
+    except Exception as qc_exc:
+        logging.exception("QC_MODULE_ERROR")
+        st.error(f"Üretim formları modülü açılamadı: {qc_exc}")
 
 # V3: uygulama betiginin tamamlanma suresi; sadece admin kendi oturumunda gorur.
 _v3_metrics = {
