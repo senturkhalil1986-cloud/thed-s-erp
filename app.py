@@ -612,6 +612,82 @@ def ensure_sample_tracking_table():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sample_tracking_firma ON public.sample_tracking(firma)")
 
 
+# Ek numune fotoğrafları ayrı tabloda saklanır; eski ana fotoğraf korunur.
+def ensure_sample_photos_table():
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.sample_photos (
+                id BIGSERIAL PRIMARY KEY,
+                takip_no TEXT NOT NULL REFERENCES public.sample_tracking(takip_no) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                storage_path TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sample_photos_takip ON public.sample_photos(takip_no)")
+
+
+def _upload_sample_image(takip_no, uploaded_image):
+    if uploaded_image is None:
+        raise ValueError("Fotoğraf seçilmedi.")
+    ext = os.path.splitext(uploaded_image.name)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        raise ValueError("Yalnızca JPG ve PNG fotoğraf yüklenebilir.")
+    data = uploaded_image.getvalue()
+    if not data or len(data) > 10 * 1024 * 1024:
+        raise ValueError("Her fotoğraf 1 bayt ile 10 MB arasında olmalıdır.")
+    import unicodedata
+    name = unicodedata.normalize("NFKD", _safe_storage_name(uploaded_image.name)).encode("ascii", "ignore").decode("ascii")
+    name = name or ("fotograf" + ext)
+    path = f"{takip_no}/urun_{secrets.token_hex(12)}_{name}"
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    _storage_request_for_bucket("POST", "numune-gorselleri", path, data=data, content_type=mime)
+    return path, mime
+
+
+def list_sample_photos(takip_no, primary_path=None, primary_name=None):
+    ensure_sample_photos_table()
+    photos = [(str(primary_name or "Ana fotoğraf"), str(primary_path))] if primary_path else []
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_name, storage_path FROM public.sample_photos WHERE takip_no=%s ORDER BY id", (str(takip_no),))
+            photos.extend(cur.fetchall())
+    return photos
+
+
+def add_sample_photos(takip_no, photos, primary_path=None):
+    photos = list(photos or [])
+    if not photos:
+        raise ValueError("En az bir fotoğraf seçin.")
+    ensure_sample_photos_table()
+    existing = list_sample_photos(takip_no, primary_path=primary_path)
+    if len(existing) + len(photos) > 5:
+        raise ValueError(f"Bu numunede {len(existing)} fotoğraf var. Toplam en fazla 5 fotoğraf olabilir.")
+    paths = []
+    try:
+        for photo in photos:
+            path, _ = _upload_sample_image(takip_no, photo)
+            paths.append((photo.name, path))
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM public.sample_tracking WHERE takip_no=%s FOR UPDATE", (str(takip_no),))
+                if cur.fetchone() is None:
+                    raise ValueError("Numune kaydı bulunamadı.")
+                cur.execute("SELECT COUNT(*) FROM public.sample_photos WHERE takip_no=%s", (str(takip_no),))
+                count = int(cur.fetchone()[0]) + (1 if primary_path else 0)
+                if count + len(paths) > 5:
+                    raise ValueError("Numunenin fotoğraf sınırı doldu; sayfayı yenileyin.")
+                for name, path in paths:
+                    cur.execute("INSERT INTO public.sample_photos(takip_no,file_name,storage_path) VALUES (%s,%s,%s)", (str(takip_no), name, path))
+    except Exception:
+        for _, path in paths:
+            try:
+                _storage_request_for_bucket("DELETE", "numune-gorselleri", path)
+            except Exception:
+                logging.exception("ORPHAN_SAMPLE_IMAGE path=%s", path)
+        raise
+    return len(paths)
+
+
 def generate_sample_tracking_no(tarih):
     ensure_sample_tracking_table()
     d = pd.to_datetime(tarih).date()
@@ -629,34 +705,37 @@ def generate_sample_tracking_no(tarih):
     return f"{prefix}{max_seq + 1:03d}"
 
 
-def save_sample_record(tarih, firma, urun_adi, urun_ozellikleri, recete, miktar, birim, gonderim_bilgisi, uploaded_image):
+def save_sample_record(tarih, firma, urun_adi, urun_ozellikleri, recete, miktar, birim, gonderim_bilgisi, uploaded_images):
     ensure_sample_tracking_table()
+    ensure_sample_photos_table()
+    photos = list(uploaded_images or [])
+    if not 1 <= len(photos) <= 5:
+        raise ValueError("Numune için 1 ile 5 fotoğraf seçilmelidir.")
     takip_no = generate_sample_tracking_no(tarih)
-    if uploaded_image is None:
-        raise ValueError("Ürün görseli zorunludur.")
-    file_bytes = uploaded_image.getvalue()
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise ValueError("Ürün görseli 10 MB'dan büyük olamaz.")
-    safe_name = _safe_storage_name(uploaded_image.name)
-    mime_type = uploaded_image.type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
-    storage_path = f"{takip_no}/urun_{secrets.token_hex(6)}_{safe_name}"
-    _storage_request_for_bucket("POST", "numune-gorselleri", storage_path, data=file_bytes, content_type=mime_type)
+    uploaded = []
     try:
+        for photo in photos:
+            path, mime = _upload_sample_image(takip_no, photo)
+            uploaded.append((photo.name, path, mime))
+        first_name, first_path, first_mime = uploaded[0]
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.sample_tracking
+                cur.execute("""INSERT INTO public.sample_tracking
                     (takip_no,tarih,firma,urun_adi,urun_ozellikleri,recete,miktar,birim,gonderim_bilgisi,
                      gorsel_adi,gorsel_mime,gorsel_storage_path,durum,musteri_onerisi,olusturan)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (takip_no, tarih, firma.strip(), urun_adi.strip(), urun_ozellikleri.strip(), recete.strip(),
-                      float(miktar), birim.strip(), gonderim_bilgisi.strip(), uploaded_image.name, mime_type,
-                      storage_path, "Değerlendirme Bekleniyor", "", st.session_state.get("username", "system")))
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (takip_no, tarih, firma.strip(), urun_adi.strip(), urun_ozellikleri.strip(), recete.strip(),
+                     float(miktar), birim.strip(), gonderim_bilgisi.strip(), first_name, first_mime,
+                     first_path, "Değerlendirme Bekleniyor", "", st.session_state.get("username", "system")))
+                for name, path, _ in uploaded[1:]:
+                    cur.execute("INSERT INTO public.sample_photos(takip_no,file_name,storage_path) VALUES (%s,%s,%s)",
+                                (takip_no, name, path))
     except Exception:
-        try:
-            _storage_request_for_bucket("DELETE", "numune-gorselleri", storage_path)
-        except Exception:
-            logging.exception("ORPHAN_SAMPLE_IMAGE path=%s", storage_path)
+        for _, path, _ in uploaded:
+            try:
+                _storage_request_for_bucket("DELETE", "numune-gorselleri", path)
+            except Exception:
+                logging.exception("ORPHAN_SAMPLE_IMAGE path=%s", path)
         raise
     return takip_no
 
@@ -2985,8 +3064,8 @@ elif choice == "8. Numune Takip":
                 birim = st.selectbox("Birim *", ["g", "kg", "ml", "L", "Adet", "Paket", "Kavanoz"])
             with c2:
                 gonderim_bilgisi = st.text_input("Gönderim / Kargo Bilgisi *", placeholder="Örn: DHL - 123456789")
-                urun_gorseli = st.file_uploader("Ürün Görseli *", type=["jpg", "jpeg", "png"], key="sample_product_image")
-                st.caption("Ürün görseli zorunludur. Azami 10 MB.")
+                urun_gorselleri = st.file_uploader("Ürün Görselleri * (1–5 fotoğraf)", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="sample_product_image")
+                st.caption("En az 1, en fazla 5 fotoğraf. Her fotoğraf en fazla 10 MB.")
 
             urun_ozellikleri = st.text_area(
                 "Ürün Özellikleri / Spesifikasyonu *",
@@ -3007,16 +3086,18 @@ elif choice == "8. Numune Takip":
             if not urun_ozellikleri.strip(): missing.append("Ürün Özellikleri")
             if not recete.strip(): missing.append("Reçete")
             if not gonderim_bilgisi.strip(): missing.append("Gönderim / Kargo Bilgisi")
-            if urun_gorseli is None: missing.append("Ürün Görseli")
+            if not urun_gorselleri: missing.append("Ürün Görseli")
             if missing:
                 st.error("Zorunlu alanları doldurun: " + ", ".join(missing))
-            elif urun_gorseli.size > 10 * 1024 * 1024:
-                st.error("Ürün görseli 10 MB'dan büyük olamaz.")
+            elif len(urun_gorselleri) > 5:
+                st.error("Bir numuneye en fazla 5 fotoğraf yüklenebilir.")
+            elif any(photo.size > 10 * 1024 * 1024 for photo in urun_gorselleri):
+                st.error("Her fotoğraf en fazla 10 MB olabilir.")
             else:
                 try:
                     takip_no = save_sample_record(
                         sample_date, firma, urun_adi, urun_ozellikleri, recete,
-                        miktar, birim, gonderim_bilgisi, urun_gorseli
+                        miktar, birim, gonderim_bilgisi, urun_gorselleri
                     )
                     audit_log("OLUŞTURMA", "NUMUNE", takip_no, new_value={
                         "firma": firma, "urun": urun_adi, "miktar": float(miktar), "birim": birim,
@@ -3101,10 +3182,34 @@ elif choice == "8. Numune Takip":
                     st.text_area("Reçete Detayı", value=str(row["recete"]), height=160, disabled=True, label_visibility="collapsed", key=f"recipe_{selected_no}")
                 with d2:
                     try:
-                        img = _storage_request_for_bucket("GET", "numune-gorselleri", row["gorsel_storage_path"])
-                        st.image(img, caption=f"{selected_no} - {row['gorsel_adi']}", use_container_width=True)
+                        sample_images = list_sample_photos(selected_no, row["gorsel_storage_path"], row["gorsel_adi"])
+                        st.markdown(f"**Numune Fotoğrafları ({len(sample_images)}/5)**")
+                        for photo_name, photo_path in sample_images:
+                            try:
+                                img = _storage_request_for_bucket("GET", "numune-gorselleri", photo_path)
+                                st.image(img, caption=photo_name, use_container_width=True)
+                            except Exception as image_exc:
+                                st.warning(f"{photo_name} açılamadı: {image_exc}")
                     except Exception as exc:
-                        st.warning(f"Ürün görseli açılamadı: {exc}")
+                        st.warning(f"Numune fotoğrafları alınamadı: {exc}")
+                        sample_images = []
+                    remaining = max(0, 5 - len(sample_images))
+                    if remaining:
+                        with st.form(f"sample_add_images_{selected_no}", clear_on_submit=True):
+                            extra_images = st.file_uploader(
+                                f"Fotoğraf Ekle (en fazla {remaining} adet)",
+                                type=["jpg", "jpeg", "png"], accept_multiple_files=True,
+                                key=f"sample_extra_images_{selected_no}")
+                            add_images_btn = st.form_submit_button("📸 Fotoğrafları Kaydet")
+                        if add_images_btn:
+                            try:
+                                added = add_sample_photos(selected_no, extra_images, row["gorsel_storage_path"])
+                                st.success(f"{added} fotoğraf eklendi.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Fotoğraflar eklenemedi: {exc}")
+                    else:
+                        st.caption("5 fotoğraf sınırına ulaşıldı.")
 
                 status_values = ["Değerlendirme Bekleniyor", "Onaylandı", "Revize İstendi", "Reddedildi"]
                 current_status = row["durum"] if row["durum"] in status_values else "Değerlendirme Bekleniyor"
