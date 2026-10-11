@@ -470,6 +470,44 @@ def _storage_request_for_bucket(method, bucket, storage_path, data=None, content
 
 
 
+# Uretim fotograflari Supabase Storage icinde kalici tutulur.
+# FotografYolu kolonu degistirilmez; yeni degerler storage:uretim/... formatindadir.
+PRODUCTION_STORAGE_PREFIX = "storage:"
+
+def upload_production_photo(work_order, uploaded_file):
+    if uploaded_file is None:
+        return ""
+    raw = uploaded_file.getvalue()
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("Uretim fotografi 10 MB sinirini asiyor.")
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        raise ValueError("Uretim fotografi JPG veya PNG olmali.")
+    safe_name = _safe_storage_name(uploaded_file.name)
+    import unicodedata
+    safe_name = unicodedata.normalize("NFKD", safe_name).encode("ascii", "ignore").decode("ascii") or ("fotograf" + ext)
+    storage_path = f"uretim/{secrets.token_hex(12)}_{safe_name}"
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    bucket = shipment_photo_bucket()
+    _storage_request_for_bucket("POST", bucket, storage_path, data=raw, content_type=mime)
+    return PRODUCTION_STORAGE_PREFIX + storage_path
+
+def read_production_photo(photo_reference):
+    reference = str(photo_reference or "").strip()
+    if not reference or reference.lower() == "nan":
+        return None
+    if reference.startswith(PRODUCTION_STORAGE_PREFIX):
+        path = reference[len(PRODUCTION_STORAGE_PREFIX):]
+        if not path.startswith("uretim/"):
+            raise ValueError("Gecersiz uretim fotografi yolu.")
+        return _storage_request_for_bucket("GET", shipment_photo_bucket(), path)
+    # Eski yerel dosya referanslari icin geriye donuk uyumluluk.
+    if os.path.isfile(reference):
+        with open(reference, "rb") as handle:
+            return handle.read()
+    return None
+
+
 # Sevkiyat fotograflari: var olan erp-files bucket'i ve ayri SQL metadata tablosu.
 @st.cache_resource(show_spinner=False)
 def ensure_shipment_photo_table():
@@ -1867,10 +1905,12 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
                             
                             photo_path = ""
                             if uploaded_photo is not None:
-                                photo_filename = f"{is_emri_no.strip()}_{int(datetime.now().timestamp())}.png"
-                                photo_path = os.path.join(PHOTO_DIR, photo_filename)
-                                with open(photo_path, "wb") as f:
-                                    f.write(uploaded_photo.getbuffer())
+                                try:
+                                    photo_path = upload_production_photo(is_emri_no.strip(), uploaded_photo)
+                                except Exception as exc:
+                                    logging.exception("PRODUCTION_PHOTO_UPLOAD_ERROR order=%s", is_emri_no.strip())
+                                    st.error(f"Fotoğraf yüklenemedi. Üretim kaydı yapılmadı: {exc}")
+                                    st.stop()
 
                             meta_df = load_data(PRODUCTION_META_FILE, ["IsEmriNo", "CalismaSaati", "IscilikGideri", "FotografYolu", "Notlar"])
                             meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != is_emri_no.strip()]
@@ -1929,11 +1969,15 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                         st.markdown(f"**Toplam Üretim Maliyeti:** {mamul_satir['ToplamTutar']:,.2f} TL (Birim: {mamul_satir['BirimFiyat']:,.2f} TL)")
                     st.markdown(f"**Mevcut Not:** {mevcut_not}")
                 with col_f2:
-                    if mevcut_foto and os.path.exists(mevcut_foto):
-                        img = Image.open(mevcut_foto)
-                        st.image(img, caption=f"İş Emri Fotoğrafı: {secilen_is_emri}", width=250)
-                    else:
-                        st.info("Bu üretime ait fotoğraf yüklenmemiş.")
+                    try:
+                        photo_bytes = read_production_photo(mevcut_foto)
+                        if photo_bytes:
+                            st.image(photo_bytes, caption=f"İş Emri Fotoğrafı: {secilen_is_emri}", width=250)
+                        else:
+                            st.info("Bu üretime ait erişilebilir fotoğraf bulunmuyor.")
+                    except Exception:
+                        logging.exception("PRODUCTION_PHOTO_READ_ERROR order=%s", secilen_is_emri)
+                        st.warning("Üretim fotoğrafı şu anda görüntülenemiyor.")
 
                 st.markdown("---")
 
@@ -2188,15 +2232,19 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                                     }
                                     yeni_eklenen_hareketler.append(mamul_giris)
 
-                                    tx_df = pd.concat([tx_df, pd.DataFrame(yeni_eklenen_hareketler)], ignore_index=True)
-                                    save_data(tx_df, STOCK_TRANSACTIONS_FILE)
-
+                                    # Fotograf yuklemesi stok yazimindan ONCE tamamlanir.
+                                    # Boylece fotografa bagli hata stok hareketini yarim birakmaz.
                                     final_photo_path = mevcut_foto
                                     if yeni_fotograf is not None:
-                                        photo_filename = f"{secilen_is_emri}_{int(datetime.now().timestamp())}.png"
-                                        final_photo_path = os.path.join(PHOTO_DIR, photo_filename)
-                                        with open(final_photo_path, "wb") as f:
-                                            f.write(yeni_fotograf.getbuffer())
+                                        try:
+                                            final_photo_path = upload_production_photo(secilen_is_emri, yeni_fotograf)
+                                        except Exception as exc:
+                                            logging.exception("PRODUCTION_PHOTO_UPDATE_ERROR order=%s", secilen_is_emri)
+                                            st.error(f"Fotoğraf yüklenemedi. Güncelleme yapılmadı: {exc}")
+                                            st.stop()
+
+                                    tx_df = pd.concat([tx_df, pd.DataFrame(yeni_eklenen_hareketler)], ignore_index=True)
+                                    save_data(tx_df, STOCK_TRANSACTIONS_FILE)
 
                                     meta_df = meta_df[meta_df["IsEmriNo"].astype(str) != str(secilen_is_emri)]
                                     new_meta = pd.DataFrame([{
