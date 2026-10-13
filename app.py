@@ -155,6 +155,33 @@ def update_user_access(username, role, active):
             if cur.rowcount == 0:
                 raise ValueError("Kullanıcı bulunamadı.")
 
+def admin_reset_user_password(username, new_password):
+    """Sadece sistem yöneticisinin mevcut kullanıcı şifresini sıfırlaması."""
+    if st.session_state.get("role") != "admin" or not st.session_state.get("authenticated"):
+        raise PermissionError("Şifre sıfırlama yalnızca sistem yöneticisine açıktır.")
+    username = str(username).strip()
+    if not username or len(new_password) < 12:
+        raise ValueError("Kullanıcı seçilmeli ve yeni şifre en az 12 karakter olmalıdır.")
+    salt = secrets.token_bytes(16)
+    hashed = password_hash(new_password, salt)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.erp_users SET salt=%s, password_hash=%s WHERE username=%s",
+                (psycopg2.Binary(salt), psycopg2.Binary(hashed), username),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Kullanıcı bulunamadı.")
+            # Şifre ve hash hiçbir zaman denetim kaydına yazılmaz.
+            cur.execute(
+                """INSERT INTO public.audit_log
+                   (username, action, entity_type, entity_id, new_value)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (st.session_state["username"], "ŞİFRE SIFIRLAMA", "KULLANICI",
+                 username, Json({"islem": "yönetici tarafından sıfırlandı"})),
+            )
+
+
 def authenticate(username, password):
     with pg_conn() as conn:
         with conn.cursor() as cur:
@@ -1090,6 +1117,28 @@ if st.session_state.get("role") == "admin":
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+                st.markdown("---")
+                st.markdown("**🔐 Kullanıcı Şifresini Sıfırla**")
+                st.caption(f"Seçili kullanıcı: {selected_user}. Eski şifre gerekmez.")
+                with st.form(f"reset_password_form_{selected_user}", clear_on_submit=True):
+                    reset_password = st.text_input(
+                        "Yeni şifre (en az 12 karakter)", type="password",
+                        key=f"reset_password_{selected_user}",
+                    )
+                    reset_confirm = st.text_input(
+                        "Yeni şifre tekrar", type="password",
+                        key=f"reset_confirm_{selected_user}",
+                    )
+                    reset_submit = st.form_submit_button("🔐 Şifreyi Sıfırla")
+                if reset_submit:
+                    if reset_password != reset_confirm:
+                        st.error("Yeni şifreler eşleşmiyor.")
+                    else:
+                        try:
+                            admin_reset_user_password(selected_user, reset_password)
+                            st.success(f"{selected_user} kullanıcısının şifresi değiştirildi.")
+                        except Exception as exc:
+                            st.error(f"Şifre değiştirilemedi: {exc}")
           except Exception as exc:
             st.error(f"Kullanıcı listesi alınamadı: {exc}")
     with st.sidebar.expander("🛟 Veri Kurtarma / Yedekleme"):
