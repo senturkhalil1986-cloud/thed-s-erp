@@ -1261,38 +1261,73 @@ if choice == "0. Yönetici Dashboard":
 elif choice == "1. Stok Kartı Tanımlama":
     st.header("🗂️ Yeni Stok Kartı Tanımlama ve Yönetimi")
     
+    # Stok kodu form dışında tutulur: yazılırken canlı uygunluk kontrolü yapılır.
+    s_code = st.text_input("Stok Kodu (Örn: HMM-01, AMB-01, MAM-01)", key="new_stock_code_live")
+    normalized_code = s_code.strip()
+    stock_code_taken = False
+    stock_code_check_ok = False
+    if normalized_code:
+        try:
+            with pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'SELECT "StokAdi" FROM public.master_items WHERE UPPER(BTRIM("StokKodu")) = UPPER(%s) LIMIT 1',
+                        (normalized_code,)
+                    )
+                    existing_stock = cur.fetchone()
+            stock_code_check_ok = True
+            stock_code_taken = existing_stock is not None
+            if stock_code_taken:
+                st.error(f"⛔ Bu stok kodu kullanılıyor: {existing_stock[0]}")
+            else:
+                st.success("✅ Bu stok kodu müsait.")
+        except Exception:
+            logging.exception("STOCK_CODE_CHECK_ERROR code=%s", normalized_code)
+            st.warning("Stok kodu şu anda doğrulanamadı. Kontrol tamamlanmadan kayıt yapılamaz.")
+    else:
+        st.info("Stok kodunu girince uygunluğu burada görünecek.")
+
     with st.form("new_stock_card", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            s_code = st.text_input("Stok Kodu (Örn: HMM-01, AMB-01, MAM-01)")
             s_name = st.text_input("Stok Adı / Cinsi (Örn: 3000 ml Pet Jalapeno Turşusu)")
         with col2:
             s_depot = st.selectbox("Varsayılan Depo", [
-                "Soğuk Hava Deposu", 
-                "Yardımcı Malzeme Deposu", 
-                "Yarı Mamül Deposu", 
+                "Soğuk Hava Deposu",
+                "Yardımcı Malzeme Deposu",
+                "Yarı Mamül Deposu",
                 "Mamül Deposu"
             ])
             s_unit = st.selectbox("Stok Birimi", ["Kg", "Adet", "Ton", "Koli", "Metre"])
-            
-        submitted = st.form_submit_button("Stok Kartını Kaydet")
+
+        submitted = st.form_submit_button("Stok Kartını Kaydet", disabled=(not normalized_code or stock_code_taken or not stock_code_check_ok))
         if submitted:
-            if not s_code.strip() or not s_name.strip():
-                st.error("Stok kodu and stok adı zorunludur!")
+            if not normalized_code or not s_name.strip():
+                st.error("Stok kodu ve stok adı zorunludur!")
             else:
-                df_master = load_data(MASTER_ITEMS_FILE, ["StokKodu", "StokAdi", "Depo", "Birim"])
-                if not df_master.empty and s_code.strip() in df_master["StokKodu"].astype(str).values:
-                    st.error(f"'{s_code}' stok kodu zaten sistemde kayıtlı!")
-                else:
-                    new_row = pd.DataFrame([{
-                        "StokKodu": s_code.strip(),
-                        "StokAdi": s_name.strip(),
-                        "Depo": s_depot,
-                        "Birim": s_unit
-                    }])
-                    df_master = pd.concat([df_master, new_row], ignore_index=True)
-                    save_data(df_master, MASTER_ITEMS_FILE)
-                    st.success(f"'{s_name.strip()}' ({s_code.strip()}) stok kartı başarıyla açıldı!")
+                try:
+                    # Yalnızca yeni kartı INSERT et; eski kartları DELETE/yeniden INSERT yapma.
+                    # Aynı anda açılan iki oturum bu işlem sırasında birbirini bekler.
+                    with pg_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT pg_advisory_xact_lock(%s)", (78112026,))
+                            cur.execute(
+                                'SELECT "StokAdi" FROM public.master_items WHERE UPPER(BTRIM("StokKodu")) = UPPER(%s) LIMIT 1',
+                                (normalized_code,)
+                            )
+                            duplicate = cur.fetchone()
+                            if duplicate:
+                                st.error(f"⛔ '{normalized_code}' stok kodu zaten kayıtlı: {duplicate[0]}")
+                            else:
+                                cur.execute(
+                                    'INSERT INTO public.master_items ("StokKodu", "StokAdi", "Depo", "Birim") VALUES (%s, %s, %s, %s)',
+                                    (normalized_code, s_name.strip(), s_depot, s_unit)
+                                )
+                                _load_table_cached.clear()
+                                st.success(f"'{s_name.strip()}' ({normalized_code}) stok kartı başarıyla açıldı!")
+                except Exception as exc:
+                    logging.exception("STOCK_CARD_INSERT_ERROR code=%s", normalized_code)
+                    st.error(f"Stok kartı kaydedilemedi: {exc}")
 
     st.subheader("📋 Sistemde Tanımlı Stok Kartları ve Silme")
     master_df = load_data(MASTER_ITEMS_FILE, ["StokKodu", "StokAdi", "Depo", "Birim"])
