@@ -2174,6 +2174,87 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                     logging.exception("PRODUCTION_EXPORT_ERROR order=%s", secilen_is_emri)
                     st.error("Üretim föyü Excel dosyası oluşturulamadı. Yönetici loglarını kontrol edin.")
 
+                # Ürün kartı düzeltmesi stok hareketlerini yeniden oluşturmadan yapılır.
+                # Sevkiyata/çıkışa konu olmuş lotların değiştirilmesi engellenir.
+                if current_role in ("admin", "yonetici"):
+                    with st.expander("✏️ Üretilen mamulü / stok kartını düzelt", expanded=False):
+                        st.caption("Yalnızca yanlış seçilen mamul stok kartını düzeltir. Miktar, maliyet, sarfiyat ve iş emri değişmez.")
+                        mamul_kartlari = master_df[master_df["Depo"].astype(str).str.strip() == "Mamül Deposu"].copy()
+                        mamul_kartlari = mamul_kartlari.drop_duplicates(subset=["StokKodu"])
+                        kart_kodlari = mamul_kartlari["StokKodu"].astype(str).tolist()
+                        eski_kod = str(mamul_satir["StokKodu"]).strip()
+                        if not kart_kodlari:
+                            st.warning("Mamül Deposu için tanımlı stok kartı bulunamadı.")
+                        else:
+                            with st.form(f"correct_finished_item_{secilen_is_emri}"):
+                                secilen_yeni_kod = st.selectbox(
+                                    "Doğru mamul stok kartı",
+                                    kart_kodlari,
+                                    index=kart_kodlari.index(eski_kod) if eski_kod in kart_kodlari else 0,
+                                    format_func=lambda kod: f"{kod} - {mamul_kartlari.loc[mamul_kartlari['StokKodu'].astype(str) == kod, 'StokAdi'].iloc[0]}",
+                                )
+                                onayla_kart = st.checkbox("Ürün kartı değişikliğini onaylıyorum")
+                                kaydet_kart = st.form_submit_button("💾 Mamul stok kartını düzelt")
+                            if kaydet_kart:
+                                if not onayla_kart:
+                                    st.error("Devam etmek için değişikliği onaylayın.")
+                                elif secilen_yeni_kod == eski_kod:
+                                    st.info("Zaten bu mamul stok kartı seçili.")
+                                else:
+                                    try:
+                                        with pg_conn() as conn:
+                                            with conn.cursor() as cur:
+                                                cur.execute(
+                                                    'SELECT "StokKodu", "StokAdi", "Birim" FROM public.master_items '
+                                                    'WHERE "StokKodu"=%s AND "Depo"=%s',
+                                                    (secilen_yeni_kod, "Mamül Deposu"),
+                                                )
+                                                kartlar = cur.fetchall()
+                                                if len(kartlar) != 1:
+                                                    raise ValueError("Yeni stok kartı tekil olarak bulunamadı.")
+                                                yeni_kod, yeni_ad, yeni_birim = kartlar[0]
+                                                cur.execute(
+                                                    'SELECT "StokKodu", "StokAdi", "Birim" FROM public.stock_transactions '
+                                                    'WHERE "PartiNo"=%s AND "Tedarikci"=%s AND "HareketTuru"=%s FOR UPDATE',
+                                                    (str(secilen_is_emri), "Dahili Üretim", "Giriş"),
+                                                )
+                                                kayitlar = cur.fetchall()
+                                                if len(kayitlar) != 1:
+                                                    raise ValueError("Bu iş emri için tek bir mamul giriş kaydı bulunamadı. İşlem durduruldu.")
+                                                onceki_kod, onceki_ad, onceki_birim = kayitlar[0]
+                                                if str(onceki_kod).strip() != eski_kod:
+                                                    raise ValueError("Üretim başka bir kullanıcı tarafından değiştirildi. Sayfayı yenileyin.")
+                                                if str(onceki_birim).strip() != str(yeni_birim).strip():
+                                                    raise ValueError("Eski ve yeni ürünün stok birimi farklı. Otomatik düzeltme yapılamaz.")
+                                                cur.execute(
+                                                    'SELECT COUNT(*) FROM public.stock_transactions '
+                                                    'WHERE "PartiNo"=%s AND "StokKodu"=%s AND "HareketTuru"=%s',
+                                                    (str(secilen_is_emri), onceki_kod, "Çıkış"),
+                                                )
+                                                if cur.fetchone()[0]:
+                                                    raise ValueError("Bu üretim lotundan çıkış/sevkiyat yapılmış. İlişkili kayıtlar kontrol edilmeden ürün değiştirilemez.")
+                                                cur.execute(
+                                                    'UPDATE public.stock_transactions SET "StokKodu"=%s, "StokAdi"=%s '
+                                                    'WHERE "PartiNo"=%s AND "Tedarikci"=%s AND "HareketTuru"=%s '
+                                                    'AND "StokKodu"=%s',
+                                                    (yeni_kod, yeni_ad, str(secilen_is_emri), "Dahili Üretim", "Giriş", onceki_kod),
+                                                )
+                                                if cur.rowcount != 1:
+                                                    raise ValueError("Mamul kaydı güvenli biçimde güncellenemedi.")
+                                                cur.execute(
+                                                    'INSERT INTO public.audit_log(username,action,entity_type,entity_id,old_value,new_value) '
+                                                    'VALUES (%s,%s,%s,%s,%s,%s)',
+                                                    (st.session_state.get("username", "system"), "MAMUL_KARTI_DUZELTME", "URETIM",
+                                                     str(secilen_is_emri), Json({"StokKodu": onceki_kod, "StokAdi": onceki_ad}),
+                                                     Json({"StokKodu": yeni_kod, "StokAdi": yeni_ad})),
+                                                )
+                                        _load_table_cached.clear()
+                                        st.success("Mamul stok kartı düzeltildi; miktar, sarfiyat ve maliyet değişmedi.")
+                                        st.rerun()
+                                    except Exception as exc:
+                                        logging.exception("PRODUCTION_ITEM_CORRECTION_ERROR order=%s", secilen_is_emri)
+                                        st.error(f"Ürün kartı değiştirilemedi: {exc}")
+
                 with st.expander(f"⚙️ '{secilen_is_emri}' Nolu Föyü and Tüm Kalemlerini Güncelle / Sil", expanded=False):
                     with st.form(f"edit_full_form_{secilen_is_emri}"):
                         st.subheader("1️⃣ Üretilen Mamül Miktarı Güncelleme")
