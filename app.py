@@ -1814,6 +1814,9 @@ elif choice == "4. Üretime Sevk / Reçeteli Üretim and Maliyet":
             )
         parti_stoklari = []
         for _, g_row in giris_transactions.iterrows():
+            # Mamul deposundaki bitmis urunler hammadde sarfiyatinda secilemez.
+            if str(g_row["Depo"]).strip().casefold() == "mamül deposu".casefold():
+                continue
             s_kod = g_row["StokKodu"]
             p_no = str(g_row["PartiNo"]).strip()
             d_adi = g_row["Depo"]
@@ -2268,6 +2271,9 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                         
                         parti_stoklari_ed = []
                         for _, g_row in giris_tx_ed.iterrows():
+                            # Duzenleme ekraninda da mamul deposu sarf listesinden haric.
+                            if str(g_row["Depo"]).strip().casefold() == "mamül deposu".casefold():
+                                continue
                             s_kod = g_row["StokKodu"]
                             p_no = str(g_row["PartiNo"]).strip()
                             d_adi = g_row["Depo"]
