@@ -2115,13 +2115,66 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
     if tx_df.empty:
         st.info("Henüz sistemde hiç hareket bulunmuyor.")
     else:
-        st.subheader("📝 Kayıtlı Üretim Föyleri (İş Emirleri) Yönetimi & Tam Kalem Düzenleme / Silme")
-        uretim_kayitlari = tx_df[(tx_df["Tedarikci"] == "Dahili Üretim") | (tx_df["Depo"] == "Mamül Deposu") & (tx_df["HareketTuru"] == "Giriş")]
-        
+        st.subheader("📝 Üretim Föyleri Yönetim Merkezi")
+        st.caption("Son üretim otomatik seçilir. Eski iş emirlerini arayabilir ve mevcut düzenleme işlemlerini kullanabilirsiniz.")
+        # Yalnızca gerçek mamul üretim girişleri; diğer mamul depo hareketleri hariç.
+        uretim_kayitlari = tx_df[
+            (tx_df["HareketTuru"].astype(str).str.strip() == "Giriş")
+            & (tx_df["Tedarikci"].astype(str).str.strip() == "Dahili Üretim")
+        ].copy()
+
         if not uretim_kayitlari.empty:
-            is_emri_secenekleri = uretim_kayitlari["PartiNo"].astype(str).unique().tolist()
-            secilen_is_emri = st.selectbox("İşlemi Yönetmek / Düzenlemek / Silmek İstediğin İş Emri / Parti No", is_emri_secenekleri)
-            
+            # Tarihe göre yeni -> eski. Aynı tarihte mevcut kayıt sırası korunur,
+            # böylece son eklenen üretim üstte kalır.
+            uretim_kayitlari["_kayit_sirasi"] = range(len(uretim_kayitlari))
+            uretim_kayitlari["_uretim_tarihi"] = pd.to_datetime(
+                uretim_kayitlari["Tarih"], errors="coerce", dayfirst=True
+            )
+            uretim_kayitlari = uretim_kayitlari.sort_values(
+                ["_uretim_tarihi", "_kayit_sirasi"], ascending=[False, False],
+                kind="stable", na_position="last"
+            )
+            uretim_kayitlari = uretim_kayitlari.drop_duplicates(subset=["PartiNo"], keep="first")
+            is_emri_secenekleri = uretim_kayitlari["PartiNo"].dropna().astype(str).tolist()
+            son_otuz_gun = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+            yakin_uretim = int((uretim_kayitlari["_uretim_tarihi"] >= son_otuz_gun).sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Kayıtlı üretim föyü", len(is_emri_secenekleri))
+            m2.metric("Son 30 gündeki üretim", yakin_uretim)
+            m3.metric("En son iş emri", is_emri_secenekleri[0] if is_emri_secenekleri else "—")
+
+            arama = st.text_input(
+                "🔎 İş emri, ürün adı veya stok kodu ile ara",
+                key="foy_yonetimi_arama",
+                placeholder="Örn: SGM1, MML.100 veya domates"
+            ).strip().casefold()
+            if arama:
+                aranan = uretim_kayitlari[
+                    uretim_kayitlari[["PartiNo", "StokKodu", "StokAdi"]]
+                    .fillna("").astype(str).apply(
+                        lambda col: col.str.casefold().str.contains(arama, regex=False)
+                    ).any(axis=1)
+                ]
+                gorunen_emirler = aranan["PartiNo"].astype(str).tolist()
+            else:
+                gorunen_emirler = is_emri_secenekleri
+
+            if not gorunen_emirler:
+                st.info("Aramanızla eşleşen üretim bulunamadı.")
+                secilen_is_emri = None
+            else:
+                # Arama yapılmadığında yeni üretim varsayılan olarak ilk sırada.
+                secilen_is_emri = st.selectbox(
+                    "İşlemi Yönetmek / Düzenlemek / Silmek İstediğin İş Emri / Parti No",
+                    gorunen_emirler,
+                    format_func=lambda emir: (
+                        f"{emir} — " + str(uretim_kayitlari.loc[
+                            uretim_kayitlari["PartiNo"].astype(str) == emir, "StokAdi"
+                        ].iloc[0])
+                    ),
+                    key="foy_yonetimi_secim",
+                )
+
             if secilen_is_emri:
                 mamul_satir = uretim_kayitlari[uretim_kayitlari["PartiNo"].astype(str) == str(secilen_is_emri)].iloc[0]
                 
