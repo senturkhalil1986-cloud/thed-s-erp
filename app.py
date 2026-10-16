@@ -3605,6 +3605,7 @@ elif choice == "9. Üretim Formları":
                                     st.warning("Kaydetmek için en az bir kontrol satırı doldurun.")
                                 else:
                                     try:
+                                        saved_count = 0
                                         with pg_conn() as conn:
                                             with conn.cursor() as cur:
                                                 cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
@@ -3614,8 +3615,11 @@ elif choice == "9. Üretim Formları":
                                                 else:
                                                     for vals in new_rows:
                                                         cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid, Json(vals), username))
-                                                    st.success(f"{len(new_rows)} kontrol satırı kaydedildi.")
-                                                    st.rerun()
+                                                    saved_count = len(new_rows)
+                                        # PostgreSQL transaction burada commit edildi.
+                                        if saved_count:
+                                            st.toast(f"{saved_count} kontrol satırı kaydedildi.", icon="✅")
+                                            st.rerun()
                                     except Exception as exc:
                                         st.error(f"Kontroller kaydedilemedi: {exc}")
                     else:
@@ -3628,6 +3632,7 @@ elif choice == "9. Üretim Formları":
                             if not any(str(v).strip() for v in vals.values()):
                                 st.error("En az bir alan doldurulmalıdır.")
                             else:
+                                entry_saved = False
                                 with pg_conn() as conn:
                                     with conn.cursor() as cur:
                                         cur.execute("SELECT status FROM public.qc_forms WHERE id=%s FOR UPDATE", (fid,))
@@ -3635,8 +3640,11 @@ elif choice == "9. Üretim Formları":
                                             st.error("Form artık kayıt kabul etmiyor; sayfayı yenileyin.")
                                         else:
                                             cur.execute("INSERT INTO public.qc_form_entries(form_id,data,entered_by) VALUES(%s,%s,%s)", (fid,Json(vals),username))
-                                            st.success("Kontrol kaydedildi.")
-                                            st.rerun()
+                                            entry_saved = True
+                                # Yenileme yalnızca başarılı commit sonrasında yapılır.
+                                if entry_saved:
+                                    st.toast("Kontrol kaydedildi.", icon="✅")
+                                    st.rerun()
                     if st.button("📨 Üretim Bitti / Onaya Gönder", key=f"submit_{fid}"):
                         with pg_conn() as conn:
                             with conn.cursor() as cur:
