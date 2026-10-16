@@ -2885,55 +2885,121 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
                 kart_gosterim = kart_hareketleri[gosterim_kolonlari].sort_index(ascending=False)
                 st.dataframe(kart_gosterim.style.format({"Miktar":"{:,.2f}"}), use_container_width=True)
 
-            # Seçilen stok kartının giriş / çıkış hareketlerini Excel'e aktar
+            # Salt okunur, gerçek XLSX çıktısı. Stok ve maliyet kayıtlarına yazmaz.
             def convert_stock_card_movements_to_excel(df):
-                export_df = df.copy()
-                export_df = export_df.rename(columns={
-                    "HareketTuru": "Hareket Türü",
-                    "PartiNo": "Parti / Lot No",
-                    "BirimFiyat": "Birim Fiyat (TL)",
-                    "ToplamTutar": "Toplam Tutar (TL)",
-                    "Tedarikci": "Tedarikçi / İş Emri",
-                    "Aciklama": "Açıklama"
-                })
-                html_table = export_df.to_html(index=False, escape=False)
-                excel_html = f"""
-                <html xmlns:o="urn:schemas-microsoft-com:office:office"
-                      xmlns:x="urn:schemas-microsoft-com:office:excel"
-                      xmlns="http://www.w3.org/TR/REC-html40">
-                <head>
-                <meta http-equiv="content-type" content="text/html; charset=UTF-8">
-                <!--[if gte mso 9]>
-                <xml>
-                <x:ExcelWorkbook>
-                <x:ExcelWorksheets>
-                <x:ExcelWorksheet>
-                <x:Name>Stok Kartı Hareketleri</x:Name>
-                <x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
-                </x:ExcelWorksheet>
-                </x:ExcelWorksheets>
-                </x:ExcelWorkbook>
-                </xml>
-                <![endif]-->
-                </head>
-                <body>
-                <h3>{secilen_stok_kart}</h3>
-                <p><b>Toplam Giriş:</b> {toplam_giris:,.2f} {birim} &nbsp; | &nbsp;
-                   <b>Toplam Çıkış:</b> {toplam_cikis:,.2f} {birim} &nbsp; | &nbsp;
-                   <b>Net Stok:</b> {net_stok:,.2f} {birim}</p>
-                {html_table}
-                </body>
-                </html>
-                """
-                return excel_html.encode("utf-8")
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                from openpyxl.utils import get_column_letter
+                from datetime import date
+                from io import BytesIO
+
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Stok Kartı Hareketleri"
+                ws.sheet_view.showGridLines = False
+                columns = [
+                    ("Tarih", "Tarih", 15),
+                    ("HareketTuru", "Hareket Türü", 17),
+                    ("Depo", "Depo", 25),
+                    ("PartiNo", "Parti / Lot No", 22),
+                    ("Miktar", "Miktar", 18),
+                    ("Birim", "Birim", 12),
+                ]
+                if can_view_financial:
+                    columns += [("BirimFiyat", "Birim Fiyat (TL)", 20),
+                                ("ToplamTutar", "Toplam Tutar (TL)", 23)]
+                columns += [("Tedarikci", "Tedarikçi / İş Emri", 30),
+                            ("Aciklama", "Açıklama", 42)]
+                ncol = len(columns)
+                end_col = get_column_letter(ncol)
+                navy, blue, pale = "17365D", "24476E", "EAF1F8"
+                ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=ncol)
+                title = ws.cell(1, 1, "THE DIŞ TİCARET  |  STOK KARTI HAREKET RAPORU")
+                title.font = Font(name="Calibri", size=17, bold=True, color="FFFFFF")
+                title.fill = PatternFill("solid", fgColor=navy)
+                title.alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[1].height = 26
+                ws.row_dimensions[2].height = 22
+                ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncol)
+                product = ws.cell(3, 1, secilen_stok_kart)
+                product.font = Font(name="Calibri", size=13, bold=True, color=navy)
+                product.alignment = Alignment(vertical="center")
+                ws.row_dimensions[3].height = 29
+                summary_items = [("TOPLAM GİRİŞ", float(toplam_giris)),
+                                 ("TOPLAM ÇIKIŞ", float(toplam_cikis)),
+                                 ("NET STOK", float(net_stok))]
+                # Üç ayrı özet kutusu; miktarlar gerçek sayıdır.
+                for i, (label, value) in enumerate(summary_items):
+                    start = 1 + i * (ncol // 3)
+                    stop = (1 + (i + 1) * (ncol // 3) - 1) if i < 2 else ncol
+                    ws.merge_cells(start_row=5, start_column=start, end_row=5, end_column=stop)
+                    ws.merge_cells(start_row=6, start_column=start, end_row=6, end_column=stop)
+                    lc = ws.cell(5, start, label)
+                    lc.font = Font(bold=True, color="64748B", size=10)
+                    lc.alignment = Alignment(horizontal="center")
+                    vc = ws.cell(6, start, value)
+                    vc.number_format = '#,##0.00 "' + str(birim).replace('"', '') + '"'
+                    vc.font = Font(bold=True, color=navy, size=16)
+                    vc.alignment = Alignment(horizontal="center")
+                ws.row_dimensions[6].height = 29
+                header_row = 9
+                for idx, (_, header, width) in enumerate(columns, 1):
+                    ws.column_dimensions[get_column_letter(idx)].width = width
+                    cell = ws.cell(header_row, idx, header)
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill("solid", fgColor=blue)
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                ws.row_dimensions[header_row].height = 33
+                for row_num, (_, record) in enumerate(df.iterrows(), start=header_row + 1):
+                    for idx, (field, _, _) in enumerate(columns, 1):
+                        value = record.get(field, "")
+                        cell = ws.cell(row_num, idx)
+                        if field in ("Miktar", "BirimFiyat", "ToplamTutar"):
+                            number = pd.to_numeric(value, errors="coerce")
+                            cell.value = float(number) if pd.notna(number) else None
+                            cell.number_format = '#,##0.00'
+                        elif field == "Tarih":
+                            parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+                            if pd.notna(parsed):
+                                cell.value = parsed.to_pydatetime().date()
+                                cell.number_format = 'DD.MM.YYYY'
+                            else:
+                                cell.value = "" if pd.isna(value) else str(value)
+                        else:
+                            cell.value = "" if pd.isna(value) else str(value)
+                            if field == "PartiNo":
+                                cell.number_format = "@"
+                        cell.alignment = Alignment(vertical="center", wrap_text=True,
+                                                   horizontal="right" if field in ("Miktar", "BirimFiyat", "ToplamTutar") else "left")
+                        if row_num % 2 == 0:
+                            cell.fill = PatternFill("solid", fgColor=pale)
+                        if field == "HareketTuru":
+                            cell.font = Font(bold=True, color="166534" if str(value) == "Giriş" else "B91C1C")
+                    ws.row_dimensions[row_num].height = 25
+                last = header_row + len(df)
+                ws.auto_filter.ref = f"A{header_row}:{end_col}{max(last, header_row + 1)}"
+                ws.freeze_panes = "A10"
+                ws.sheet_properties.pageSetUpPr.fitToPage = True
+                ws.page_setup.orientation = "landscape"
+                ws.page_setup.paperSize = ws.PAPERSIZE_A3
+                ws.page_setup.fitToWidth = 1
+                ws.page_setup.fitToHeight = 0
+                ws.print_title_rows = "1:9"
+                ws.print_area = f"A1:{end_col}{max(last, header_row + 1)}"
+                ws.print_options.horizontalCentered = True
+                ws.oddFooter.center.text = "Sayfa &P / &N"
+                ws.sheet_view.zoomScale = 85
+                output = BytesIO()
+                wb.save(output)
+                return output.getvalue()
 
             kart_excel_data = convert_stock_card_movements_to_excel(kart_gosterim)
             guvenli_stok_kodu = secilen_stok_kodu.replace("/", "-").replace("\\", "-")
             st.download_button(
-                label="📥 Seçili Stok Kartı Hareketlerini Excel'e Aktar (.xls)",
+                label="📥 Seçili Stok Kartı Hareketlerini Excel'e Aktar (.xlsx)",
                 data=kart_excel_data,
-                file_name=f"stok_karti_hareketleri_{guvenli_stok_kodu}.xls",
-                mime="application/vnd.ms-excel",
+                file_name=f"stok_karti_hareketleri_{guvenli_stok_kodu}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="stok_karti_hareket_excel"
             )
         else:
