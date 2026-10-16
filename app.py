@@ -3560,10 +3560,11 @@ elif choice == "9. Üretim Formları":
                         saved_rows.append({**{c: str(values.get(c) or "") for c in metal_grid_cols},
                                            "Kontrol Eden": str(r.entered_by),
                                            "Kayıt Zamanı": str(r.created_at)})
-                    if saved_rows:
-                        st.dataframe(pd.DataFrame(saved_rows), use_container_width=True, hide_index=True)
-                    else:
-                        st.info("Henüz kaydedilmiş kontrol satırı yok. Aşağıdaki tabloya ilk kontrolü girin.")
+                    if form.status not in ("Açık", "Düzeltmeye İade"):
+                        if saved_rows:
+                            st.dataframe(pd.DataFrame(saved_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Henüz kaydedilmiş kontrol satırı yok.")
                 elif not entries.empty:
                     table_rows = [{"Kayıt No": int(r.id), "Zaman": str(r.created_at), "Personel": r.entered_by, **r.data} for r in entries.itertuples(index=False)]
                     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
@@ -3573,13 +3574,19 @@ elif choice == "9. Üretim Formları":
                     if form.status == "Düzeltmeye İade":
                         st.warning("İade gerekçesi: " + str(form.return_reason or "Belirtilmedi"))
                     if form.form_type == "Metal Dedektör Kontrol":
-                        st.caption("Kaydedilen kontroller yukarıdaki tabloda dolu kalır. Yeni kontrolü aşağıya girip kaydedin; saatler serbesttir.")
+                        st.caption("Kaydedilen kontroller bu tabloda dolu kalır. En alttaki boş satıra yeni kontrolü girin. Eski kayıtlar değiştirilemez.")
                         grid_cols = ["Kontrol Saati", "Fe Testi", "NonFe Testi", "SS Testi", "Alarm / Red Sistemi", "Açıklama"]
-                        with st.form(f"qc_metal_grid_{fid}", clear_on_submit=True):
+                        # Kaydedilmiş satırlar ve yeni giriş alanı aynı tabloda görünür.
+                        # Önceki kayıtlar SQL'de asla değiştirilmez; değişiklik denemesi reddedilir.
+                        display_cols = grid_cols + ["Kontrol Eden", "Kayıt Zamanı"]
+                        blank = {col: "" for col in display_cols}
+                        combined = pd.DataFrame(saved_rows + [blank], columns=display_cols)
+                        with st.form(f"qc_metal_grid_{fid}"):
                             draft = st.data_editor(
-                                pd.DataFrame([{col: "" for col in grid_cols}]),
+                                combined,
                                 num_rows="dynamic", use_container_width=True, hide_index=True,
-                                key=f"qc_metal_editor_{fid}",
+                                disabled=["Kontrol Eden", "Kayıt Zamanı"],
+                                key=f"qc_metal_editor_{fid}_{len(saved_rows)}",
                                 column_config={
                                     "Kontrol Saati": st.column_config.TextColumn("Kontrol Saati (SS:DD)", help="Örnek: 07:30, 10:15"),
                                     "Fe Testi": st.column_config.TextColumn("Fe Testi"),
@@ -3587,12 +3594,23 @@ elif choice == "9. Üretim Formları":
                                     "SS Testi": st.column_config.TextColumn("SS Testi"),
                                     "Alarm / Red Sistemi": st.column_config.TextColumn("Alarm / Red Sistemi"),
                                     "Açıklama": st.column_config.TextColumn("Açıklama"),
+                                    "Kontrol Eden": st.column_config.TextColumn("Kontrol Eden"),
+                                    "Kayıt Zamanı": st.column_config.TextColumn("Kayıt Zamanı"),
                                 },
                             )
                             add_entry = st.form_submit_button("💾 Doldurulan Kontrol Satırlarını Kaydet")
                         if add_entry:
                             new_rows = []
-                            for _, row in draft.iterrows():
+                            saved_count_rows = len(saved_rows)
+                            # Kaydedilen satırların değiştirilmesine veya silinmesine izin verme.
+                            unchanged = len(draft) >= saved_count_rows and all(
+                                all(str(draft.iloc[i][c]) == saved_rows[i][c] for c in display_cols)
+                                for i in range(saved_count_rows)
+                            )
+                            if not unchanged:
+                                st.error("Kaydedilmiş satırlar değiştirilemez veya silinemez. Sayfayı yenileyip yalnızca yeni satır ekleyin.")
+                                new_rows = None
+                            for _, row in (draft.iloc[saved_count_rows:] if unchanged else draft.iloc[0:0]).iterrows():
                                 vals = {col: "" if pd.isna(row[col]) else str(row[col]).strip() for col in grid_cols}
                                 if any(vals.values()):
                                     if not vals["Kontrol Saati"]:
