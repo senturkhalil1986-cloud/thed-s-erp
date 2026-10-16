@@ -2815,44 +2815,110 @@ elif choice == "5. Stok Durumu, Hareket Panosu and Föy Düzenleme":
             })
             st.dataframe(summary_df.drop(columns=["Stok Kodu"], errors="ignore").style.format({"Toplam Giriş":"{:,.2f}", "Toplam Çıkış":"{:,.2f}", "Net Kalan":"{:,.2f}"}), use_container_width=True)
             
-            def convert_df_to_excel(df):
-                html_table = df.to_html(index=False, escape=False)
-                excel_html = f"""
-                <html xmlns:o="urn:schemas-microsoft-com:office:office" 
-                      xmlns:x="urn:schemas-microsoft-com:office:excel" 
-                      xmlns="http://www.w3.org/TR/REC-html40">
-                <head>
-                <meta http-equiv="content-type" content="text/html; charset=UTF-8">
-                <!--[if gte mso 9]>
-                <xml>
-                <x:ExcelWorkbook>
-                <x:ExcelWorksheets>
-                <x:ExcelWorksheet>
-                <x:Name>Stok Durumu</x:Name>
-                <x:WorksheetOptions>
-                <x:DisplayGridlines/>
-                </x:WorksheetOptions>
-                </x:ExcelWorksheet>
-                </x:ExcelWorksheets>
-                </x:ExcelWorkbook>
-                </xml>
-                <![endif]-->
-                </head>
-                <body>
-                {html_table}
-                </body>
-                </html>
-                """
-                return excel_html.encode('utf-8')
+            # Salt okunur gerçek XLSX: genel liste + her depo için ayrı sekme.
+            def convert_depot_summary_to_xlsx(selected_df):
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                from openpyxl.utils import get_column_letter
+                from io import BytesIO
 
-            excel_data = convert_df_to_excel(summary_df)
-            
-            st.download_button(
-                label="📥 Güncel Stok Raporunu Excel Olarak İndir (.xls)",
-                data=excel_data,
-                file_name=f"stok_durumu_{secilen_depo_filtre}.xls",
-                mime="application/vnd.ms-excel"
-            )
+                wb = Workbook()
+                wb.remove(wb.active)
+                cols = ["Stok Kodu", "Stok Adı", "Depo", "Birim", "Toplam Giriş", "Toplam Çıkış", "Net Kalan"]
+                widths = [20, 49, 31, 14, 20, 20, 20]
+                navy, blue, pale = "17365D", "24476E", "EAF1F8"
+                num_fmt = '#,##0.00'
+
+                def add_sheet(title, rows, scope):
+                    ws = wb.create_sheet(title)
+                    ws.sheet_view.showGridLines = False
+                    ws.merge_cells("A1:G2")
+                    c = ws["A1"]
+                    c.value = "THE DIŞ TİCARET  |  DEPO BAZLI STOK DURUM RAPORU"
+                    c.font = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
+                    c.fill = PatternFill("solid", fgColor=navy)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                    ws.row_dimensions[1].height = 27
+                    ws.row_dimensions[2].height = 20
+                    ws.merge_cells("A3:G3")
+                    c = ws["A3"]
+                    c.value = "Kapsam: " + scope
+                    c.font = Font(name="Calibri", size=13, bold=True, color=navy)
+                    ws.row_dimensions[3].height = 29
+                    ws.merge_cells("A5:G5")
+                    c = ws["A5"]
+                    c.value = f"Stok kalemi: {len(rows):,}   |   Farklı ölçü birimleri birbirine eklenmez."
+                    c.font = Font(color="64748B", italic=True)
+                    ws.row_dimensions[5].height = 24
+                    for j, (header, width) in enumerate(zip(cols, widths), 1):
+                        ws.column_dimensions[get_column_letter(j)].width = width
+                        c = ws.cell(8, j, header)
+                        c.font = Font(bold=True, color="FFFFFF")
+                        c.fill = PatternFill("solid", fgColor=blue)
+                        c.alignment = Alignment(horizontal="center", vertical="center")
+                    ws.row_dimensions[8].height = 30
+                    for row_idx, record in enumerate(rows.itertuples(index=False, name=None), 9):
+                        for j, val in enumerate(record, 1):
+                            c = ws.cell(row_idx, j)
+                            if j >= 5:
+                                v = pd.to_numeric(val, errors="coerce")
+                                c.value = float(v) if pd.notna(v) else None
+                                c.number_format = num_fmt
+                                c.alignment = Alignment(horizontal="right", vertical="center")
+                            else:
+                                c.value = "" if pd.isna(val) else str(val)
+                                c.number_format = "@"
+                                c.alignment = Alignment(vertical="center", wrap_text=(j == 2))
+                            if row_idx % 2 == 1:
+                                c.fill = PatternFill("solid", fgColor=pale)
+                            if j == 7:
+                                c.font = Font(bold=True, color="166534" if (c.value or 0) >= 0 else "B91C1C")
+                        ws.row_dimensions[row_idx].height = 28
+                    last = max(9, 8 + len(rows))
+                    ws.auto_filter.ref = f"A8:G{last}"
+                    ws.freeze_panes = "C9"
+                    ws.sheet_properties.pageSetUpPr.fitToPage = True
+                    ws.page_setup.orientation = "landscape"
+                    ws.page_setup.paperSize = ws.PAPERSIZE_A3
+                    ws.page_setup.fitToWidth = 1
+                    ws.page_setup.fitToHeight = 0
+                    ws.print_title_rows = "1:8"
+                    ws.print_options.horizontalCentered = True
+                    ws.print_area = f"A1:G{last}"
+                    ws.oddFooter.center.text = "Sayfa &P / &N"
+                    return ws
+
+                add_sheet("Genel Stok Listesi", selected_df[cols],
+                          "Tüm Depolar" if secilen_depo_filtre == "Tümü" else secilen_depo_filtre)
+                used_names = {"Genel Stok Listesi"}
+                for depot in selected_df["Depo"].dropna().astype(str).unique():
+                    safe = "".join("_" if ch in "[]:*?/\\" else ch for ch in depot).strip()[:31] or "Depo"
+                    base, suffix = safe, 2
+                    while safe.casefold() in {n.casefold() for n in used_names}:
+                        tail = f"_{suffix}"
+                        safe = base[:31-len(tail)] + tail
+                        suffix += 1
+                    used_names.add(safe)
+                    subset = selected_df[selected_df["Depo"].astype(str) == depot]
+                    add_sheet(safe, subset[cols], depot)
+                output = BytesIO()
+                wb.save(output)
+                return output.getvalue()
+
+            try:
+                excel_data = convert_depot_summary_to_xlsx(summary_df)
+                st.download_button(
+                    label="📥 Kurumsal Depo Stok Raporunu İndir (.xlsx)",
+                    data=excel_data,
+                    file_name=f"stok_durumu_{secilen_depo_filtre}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="depot_summary_corporate_xlsx",
+                )
+            except ImportError:
+                st.warning("Excel raporu için requirements.txt dosyasında openpyxl bulunmalıdır.")
+            except Exception:
+                logging.exception("DEPOT_STOCK_XLSX_EXPORT_ERROR")
+                st.error("Depo stok Excel raporu oluşturulamadı; yönetici loglarını kontrol edin.")
 
         # Stok kartı bazında tüm giriş / çıkış hareketleri
         st.markdown("---")
