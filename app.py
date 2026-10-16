@@ -856,102 +856,191 @@ def save_data(df, filepath):
 
 
 def build_production_fiche_xlsx(work_order, finished_row, usage_rows, waste_rows, hours, labor_cost, notes, show_financial):
-    """Read-only, selected work-order export. No database writes."""
+    """Selected production work-order Excel export; read-only, never changes stock or costs."""
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
     from io import BytesIO
 
+    navy, blue, pale, green = "19365A", "294C73", "EAF1F8", "166534"
+    money_fmt = '#,##0.00 "TL"'
+    quantity_fmt = '#,##0.00'
     wb = Workbook()
-    summary = wb.active
-    summary.title = "Üretim Özeti"
+    ws = wb.active
+    ws.title = "Üretim Föyü"
+    ws.sheet_view.showGridLines = False
+    widths = [17, 38, 24, 19, 19, 16, 16, 20, 22]
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.merge_cells('A1:I2')
+    ws['A1'] = 'THE DIŞ TİCARET  |  ÜRETİM MALİYET VE SARFİYAT FÖYÜ' if show_financial else 'THE DIŞ TİCARET  |  ÜRETİM FÖYÜ'
+    ws['A1'].font = Font(name='Calibri', size=16, bold=True, color='FFFFFF')
+    ws['A1'].fill = PatternFill('solid', fgColor=navy)
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 27
+    ws.row_dimensions[2].height = 21
 
-    def scalar(value):
-        if value is None or pd.isna(value):
-            return ""
-        if hasattr(value, "item"):
-            value = value.item()
-        if isinstance(value, (pd.Timestamp, datetime)):
-            return str(value)
-        return value
+    def value(v):
+        if v is None:
+            return ''
+        try:
+            if pd.isna(v):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        if hasattr(v, 'item'):
+            v = v.item()
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.to_pydatetime() if isinstance(v, pd.Timestamp) else v
+        return v
 
-    def write_table(sheet_name, headers, rows, money_columns=()):
-        ws = wb.create_sheet(sheet_name)
-        ws.append(headers)
-        for row in rows:
-            ws.append([scalar(x) for x in row])
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="17365D")
-            cell.alignment = Alignment(wrap_text=True)
-        for col in ws.columns:
-            letter = get_column_letter(col[0].column)
-            max_len = max((len(str(c.value or "")) for c in col), default=8)
-            ws.column_dimensions[letter].width = min(max(max_len + 3, 14), 58)
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                if isinstance(cell.value, (int, float)):
-                    cell.number_format = '#,##0.00'
-        for idx in money_columns:
-            for col_cells in ws.iter_cols(min_col=idx, max_col=idx, min_row=2):
-                for cell in col_cells:
-                    cell.number_format = '#,##0.00 "TL"'
-        return ws
+    def field(row, label, val, label_col=1, value_col=3):
+        lc, vc = ws.cell(row, label_col, label), ws.cell(row, value_col, value(val))
+        lc.font = Font(bold=True, color=navy)
+        vc.alignment = Alignment(vertical='center', wrap_text=True)
 
-    summary.append(["THE DIŞ TİCARET - ÜRETİM FÖYÜ", ""])
-    details = [
-        ("İş Emri / Parti No", str(work_order)),
-        ("Üretim Tarihi", scalar(finished_row.get("Tarih", ""))),
-        ("Mamul Stok Kodu", scalar(finished_row.get("StokKodu", ""))),
-        ("Üretilen Mamul", scalar(finished_row.get("StokAdi", ""))),
-        ("Üretim Miktarı", float(finished_row.get("Miktar", 0))),
-        ("Birim", scalar(finished_row.get("Birim", ""))),
-        ("Çalışma Süresi (Saat)", float(hours)),
-        ("Üretim Notu", str(notes or "")),
-    ]
-    if show_financial:
-        details += [
-            ("Toplam İşçilik ve Ek Gider (TL)", float(labor_cost)),
-            ("Toplam Üretim Maliyeti (TL)", float(finished_row.get("ToplamTutar", 0))),
-            ("Birim Üretim Maliyeti (TL)", float(finished_row.get("BirimFiyat", 0))),
-        ]
-    for entry in details:
-        summary.append(list(entry))
-    summary.column_dimensions["A"].width = 38
-    summary.column_dimensions["B"].width = 75
-    summary["A1"].font = Font(bold=True, size=15, color="FFFFFF")
-    for cell in summary[1]:
-        cell.fill = PatternFill("solid", fgColor="17365D")
-    for row in summary.iter_rows(min_row=2):
-        row[0].font = Font(bold=True)
-        row[1].alignment = Alignment(wrap_text=True)
-    summary.freeze_panes = "A2"
+    field(4, 'İş Emri / Parti No', work_order)
+    field(4, 'Üretim Tarihi', finished_row.get('Tarih'), 6, 8)
+    field(5, 'Mamul Stok Kodu', finished_row.get('StokKodu'))
+    field(5, 'Üretim Miktarı', float(finished_row.get('Miktar', 0)), 6, 8)
+    ws['H5'].number_format = quantity_fmt
+    field(6, 'Üretilen Mamul', finished_row.get('StokAdi'))
+    ws.merge_cells('C6:I6')
+    ws.row_dimensions[6].height = 32
+    field(7, 'Çalışma Süresi (Saat)', float(hours))
+    field(7, 'Birim', finished_row.get('Birim'), 6, 8)
+    field(8, 'Üretim Notu', notes or '')
+    ws.merge_cells('C8:I8')
+    ws.row_dimensions[8].height = 34
 
-    base_headers = ["Tarih", "Stok Kodu", "Stok Adı", "Depo", "Parti / Lot", "Miktar", "Birim"]
-    cost_headers = ["Birim Fiyat (TL)", "Toplam Tutar (TL)"] if show_financial else []
-    def tx_values(frame):
-        for _, rec in frame.iterrows():
-            row = [rec.get("Tarih"), rec.get("StokKodu"), rec.get("StokAdi"), rec.get("Depo"),
-                   rec.get("PartiNo"), float(rec.get("Miktar", 0)), rec.get("Birim")]
+    def heading(row, title):
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
+        c = ws.cell(row, 1, title)
+        c.fill = PatternFill('solid', fgColor=blue)
+        c.font = Font(bold=True, color='FFFFFF', size=11)
+        c.alignment = Alignment(vertical='center')
+        ws.row_dimensions[row].height = 24
+
+    def header(row, names, target=ws):
+        for i, name in enumerate(names, 1):
+            c = target.cell(row, i, name)
+            c.fill = PatternFill('solid', fgColor=blue)
+            c.font = Font(bold=True, color='FFFFFF')
+            c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        target.row_dimensions[row].height = 33
+
+    def num(v):
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    def tx_rows(frame):
+        for _, r in frame.iterrows():
+            base = [value(r.get('Tarih')), value(r.get('StokKodu')), value(r.get('StokAdi')),
+                    value(r.get('Depo')), value(r.get('PartiNo')), num(r.get('Miktar')),
+                    value(r.get('Birim'))]
             if show_financial:
-                row += [float(rec.get("BirimFiyat", 0)), float(rec.get("ToplamTutar", 0))]
-            yield row
-    write_table("Hammadde Sarfiyatı", base_headers + cost_headers, list(tx_values(usage_rows)),
-                (8, 9) if show_financial else ())
-    write_table("Fire ve 2. Kalite", base_headers + cost_headers, list(tx_values(waste_rows)),
-                (8, 9) if show_financial else ())
+                base.extend([num(r.get('BirimFiyat')), num(r.get('ToplamTutar'))])
+            yield base
+
+    heading(10, '1  |  HAMMADDE VE MALZEME SARFİYATLARI')
+    headers = ['Stok Kodu', 'Stok Adı', 'Parti / Lot No', 'Depo', 'Tarih', 'Miktar', 'Birim']
     if show_financial:
-        material_total = float(pd.to_numeric(usage_rows["ToplamTutar"], errors="coerce").fillna(0).sum()) if not usage_rows.empty else 0.0
-        waste_total = float(pd.to_numeric(waste_rows["ToplamTutar"], errors="coerce").fillna(0).sum()) if not waste_rows.empty else 0.0
-        write_table("Maliyet Analizi", ["Kalem", "Tutar (TL)"], [
-            ["Hammadde Sarfiyatı", material_total],
-            ["İşçilik ve Ek Giderler", float(labor_cost)],
-            ["Fire / 2. Kalite Değeri (Düşülen)", waste_total],
-            ["Kayıtlı Toplam Üretim Maliyeti", float(finished_row.get("ToplamTutar", 0))],
-            ["Kayıtlı Birim Maliyet", float(finished_row.get("BirimFiyat", 0))],
-        ], (2,))
+        headers += ['Birim Fiyat (TL)', 'Toplam Tutar (TL)']
+    header(11, headers)
+    row_no = 12
+    for _, rec in usage_rows.iterrows():
+        vals = [value(rec.get('StokKodu')), value(rec.get('StokAdi')), value(rec.get('PartiNo')),
+                value(rec.get('Depo')), value(rec.get('Tarih')), num(rec.get('Miktar')),
+                value(rec.get('Birim'))]
+        if show_financial:
+            vals += [num(rec.get('BirimFiyat')), num(rec.get('ToplamTutar'))]
+        for i, v in enumerate(vals, 1):
+            c = ws.cell(row_no, i, v)
+            c.alignment = Alignment(vertical='center', wrap_text=True)
+            if row_no % 2 == 0:
+                c.fill = PatternFill('solid', fgColor=pale)
+        ws.cell(row_no, 6).number_format = quantity_fmt
+        if show_financial:
+            ws.cell(row_no, 8).number_format = money_fmt
+            ws.cell(row_no, 9).number_format = money_fmt
+        ws.row_dimensions[row_no].height = 27
+        row_no += 1
+    if row_no == 12:
+        ws.cell(row_no, 2, 'Bu iş emrine bağlı sarfiyat kaydı bulunamadı.')
+        row_no += 1
+    material_total = sum(num(r.get('ToplamTutar')) for _, r in usage_rows.iterrows())
+    waste_total = sum(num(r.get('ToplamTutar')) for _, r in waste_rows.iterrows())
+    if show_financial:
+        ws.cell(row_no, 8, 'SARFİYAT TOPLAMI').font = Font(bold=True, color=navy)
+        c = ws.cell(row_no, 9, material_total)
+        c.font = Font(bold=True, color=green)
+        c.number_format = money_fmt
+        row_no += 2
+        heading(row_no, '2  |  ÜRETİM MALİYET ÖZETİ')
+        for label, amount in [
+            ('Hammadde ve malzeme sarfiyatı', material_total),
+            ('İşçilik ve ek giderler', num(labor_cost)),
+            ('Fire / 2. kalite değeri (düşülen)', waste_total),
+            ('Kayıtlı toplam üretim maliyeti', num(finished_row.get('ToplamTutar'))),
+            ('Kayıtlı birim üretim maliyeti', num(finished_row.get('BirimFiyat'))),
+        ]:
+            row_no += 1
+            ws.merge_cells(start_row=row_no, start_column=1, end_row=row_no, end_column=7)
+            ws.cell(row_no, 1, label).font = Font(bold=('Kayıtlı' in label), color=navy)
+            cell = ws.cell(row_no, 9, amount)
+            cell.number_format = money_fmt
+            if 'Kayıtlı' in label:
+                cell.font = Font(bold=True, color=green)
+        row_no += 2
+        ws.cell(row_no, 1, 'Not: Maliyet değerleri ERP kayıtlarından alınır; rapor yeniden maliyet hesaplamaz.')
+        ws.merge_cells(start_row=row_no, start_column=1, end_row=row_no, end_column=9)
+        ws.cell(row_no, 1).font = Font(italic=True, color='64748B', size=10)
+
+    ws.freeze_panes = 'C12'
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.paperSize = ws.PAPERSIZE_A3
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_title_rows = '1:11'
+    ws.print_area = f'A1:I{row_no + 1}'
+    ws.oddFooter.center.text = 'Sayfa &P / &N'
+
+    def detail_sheet(title, frame):
+        sheet = wb.create_sheet(title)
+        sheet.sheet_view.showGridLines = False
+        sheet.append(['Tarih', 'Stok Kodu', 'Stok Adı', 'Depo', 'Parti / Lot', 'Miktar', 'Birim'] +
+                     (['Birim Fiyat (TL)', 'Toplam Tutar (TL)'] if show_financial else []))
+        for vals in tx_rows(frame):
+            sheet.append(vals)
+        for i, width in enumerate([18, 20, 48, 28, 24, 18, 13, 20, 23][:len(sheet[1])], 1):
+            sheet.column_dimensions[get_column_letter(i)].width = width
+        for cell in sheet[1]:
+            cell.fill = PatternFill('solid', fgColor=navy)
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.alignment = Alignment(wrap_text=True, vertical='center')
+        sheet.row_dimensions[1].height = 30
+        for r in range(2, sheet.max_row + 1):
+            for c in sheet[r]:
+                if r % 2 == 0:
+                    c.fill = PatternFill('solid', fgColor=pale)
+            sheet.cell(r, 6).number_format = quantity_fmt
+            if show_financial:
+                sheet.cell(r, 8).number_format = money_fmt
+                sheet.cell(r, 9).number_format = money_fmt
+        sheet.freeze_panes = 'C2'
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.orientation = 'landscape'
+        sheet.page_setup.paperSize = sheet.PAPERSIZE_A3
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.print_title_rows = '1:1'
+
+    detail_sheet('Hammadde Sarfiyatı', usage_rows)
+    detail_sheet('Fire ve 2. Kalite', waste_rows)
     output = BytesIO()
     wb.save(output)
     return output.getvalue()
